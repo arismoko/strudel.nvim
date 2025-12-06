@@ -193,13 +193,12 @@ async function updateEditorContent(content) {
                     }
                 });
             }
-
-            // Emulate interaction for audio playback
-            window.strudelMirror.root.click();
         }, content);
     } catch (error) {
         console.error("Error updating editor:", error);
     }
+    // Emulate interaction for audio playback
+    await page.click("#autoplay-helper");
 }
 
 async function moveEditorCursor(position) {
@@ -347,6 +346,29 @@ async function handleEvent(message) {
         if (userConfig.customCss) {
             await page.addStyleTag({ content: userConfig.customCss });
         }
+
+        // Create an invisible unfocusable autoplay helper element in the page
+        await page.evaluate(() => {
+          const el = document.createElement("div");
+          el.id = "autoplay-helper";
+          Object.assign(el.style, {
+            position: "fixed",
+            left: "0px",
+            top: "0px",
+            width: "4px",
+            height: "4px",
+            opacity: "0",
+            pointerEvents: "auto",
+            zIndex: "2147483647",
+          });
+
+          // Prevent focus on mousedown so caret in editor isn't shifted
+          el.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+          }, { passive: false });
+
+          document.body.appendChild(el);
+        });
 
         // Handle content sync
         await page.exposeFunction("sendEditorContent", async () => {
