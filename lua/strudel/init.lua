@@ -12,7 +12,8 @@ local MESSAGES = {
   READY = "STRUDEL_READY",
   CURSOR = "STRUDEL_CURSOR:",
   EVAL_ERROR = "STRUDEL_EVAL_ERROR:",
-  COMPLETIONS = "STRUDEL_COMPLETIONS:"
+  COMPLETIONS = "STRUDEL_COMPLETIONS:",
+  SAMPLES = "STRUDEL_SAMPLES:"
 }
 
 local STRUDEL_SYNC_AUTOCOMMAND = "StrudelSync"
@@ -31,6 +32,7 @@ local event_queue = {}
 local is_processing_event = false
 
 local stored_completions = nil
+local stored_samples = nil
 -- Config with default options
 local config = {
   ui = {
@@ -59,6 +61,22 @@ local function send_message(message)
 end
 local function set_completions(completions)
   stored_completions = completions
+end
+
+local function set_samples(samples)
+  stored_samples = samples
+end
+
+local function notify_lsp_samples(samples)
+  if not samples then
+    return
+  end
+
+  for _, c in pairs(vim.lsp.get_clients({ name = "strudel" })) do
+    pcall(function()
+      c.notify("strudel/samples", samples)
+    end)
+  end
 end
 local function send_cursor_position()
   if not strudel_job_id or not strudel_synced_bufnr or not strudel_ready or not config.sync_cursor then
