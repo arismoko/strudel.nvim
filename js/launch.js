@@ -243,7 +243,9 @@ async function sendCompletions(page) {
     return Object.keys(globalThis.strudelScope ?? {});
   });
   process.stdout.write(
-    MESSAGES.COMPLETIONS + base64(JSON.stringify(scope)) + "\n",
+    MESSAGES.COMPLETIONS +
+      Buffer.from(JSON.stringify(scope), "utf8").toString("base64") +
+      "\n",
   );
 }
 // Handle messages from Neovim
