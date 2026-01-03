@@ -12,6 +12,7 @@ local MESSAGES = {
   READY = "STRUDEL_READY",
   CURSOR = "STRUDEL_CURSOR:",
   EVAL_ERROR = "STRUDEL_EVAL_ERROR:",
+  COMPLETIONS = "STRUDEL_COMPLETIONS:"
 }
 
 local STRUDEL_SYNC_AUTOCOMMAND = "StrudelSync"
@@ -29,6 +30,7 @@ local last_received_cursor = nil -- {row, col}
 local event_queue = {}
 local is_processing_event = false
 
+local stored_completions = nil
 -- Config with default options
 local config = {
   ui = {
@@ -55,7 +57,9 @@ local function send_message(message)
     vim.notify("No active Strudel session", vim.log.levels.WARN)
   end
 end
-
+local function set_completions(completions)
+  stored_completions = completions
+end
 local function send_cursor_position()
   if not strudel_job_id or not strudel_synced_bufnr or not strudel_ready or not config.sync_cursor then
     return
@@ -121,7 +125,7 @@ local function handle_event(full_data)
       if config.start_on_launch then
         vim.defer_fn(function()
           M.update()
-        end, SUCCESSIVE_CMD_DELAY*2)
+        end, SUCCESSIVE_CMD_DELAY * 2)
       end
     end
   elseif full_data:match("^" .. MESSAGES.CONTENT) then
@@ -156,7 +160,26 @@ local function handle_event(full_data)
         vim.notify("Strudel Error: " .. error, vim.log.levels.ERROR)
       end)
     end
+  elseif full_data:match("^" .. MESSAGES.COMPLETIONS) then
+    local comp_b64 = full_data:sub(#MESSAGES.COMPLETIONS + 1)
+    local comp_content = base64.decode(comp_b64)
+    local ok, content = pcall(function()
+      return vim.json.decode(comp_content)
+    end
+    )
+    if not ok then
+      local err = content
+      vim.notify("Strudel Completions error: " .. err, vim.log.levels.ERROR)
+    else
+      set_completions(content)
+    end
   end
+end
+
+
+
+function M.get_completions()
+  return stored_completions or {}
 end
 
 local function process_event_queue()
@@ -388,7 +411,7 @@ function M.execute()
   if ok then
     vim.defer_fn(function()
       M.update()
-    end, SUCCESSIVE_CMD_DELAY*2)
+    end, SUCCESSIVE_CMD_DELAY * 2)
   end
 end
 
