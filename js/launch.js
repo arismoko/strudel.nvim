@@ -17,6 +17,9 @@ const MESSAGES = {
   CURSOR: "STRUDEL_CURSOR:",
   EVAL_ERROR: "STRUDEL_EVAL_ERROR:",
   SAMPLES: "STRUDEL_SAMPLES:",
+  IMPORT_LOCAL_SAMPLES: "STRUDEL_IMPORT_LOCAL_SAMPLES:",
+  IMPORT_LOCAL_SAMPLES_OK: "STRUDEL_IMPORT_LOCAL_SAMPLES_OK:",
+  IMPORT_LOCAL_SAMPLES_ERROR: "STRUDEL_IMPORT_LOCAL_SAMPLES_ERROR:",
 };
 
 const SELECTORS = {
@@ -638,6 +641,58 @@ async function handleEvent(message) {
     await updateEditorContent(content);
   } else if (message.startsWith(MESSAGES.CURSOR)) {
     await handleCursorMessage(message);
+  } else if (message.startsWith(MESSAGES.IMPORT_LOCAL_SAMPLES)) {
+    const b64 = message.slice(MESSAGES.IMPORT_LOCAL_SAMPLES.length);
+
+    try {
+      const decoded = Buffer.from(b64, "base64").toString("utf8");
+      const payload = JSON.parse(decoded);
+      const manifestUrl = payload?.manifestUrl;
+      if (typeof manifestUrl !== "string" || !manifestUrl) {
+        throw new Error("manifestUrl missing");
+      }
+
+      const res = await fetch(manifestUrl);
+      if (!res.ok) throw new Error(`Failed to fetch manifest: ${res.status}`);
+      const sampleMap = await res.json();
+
+      await page.evaluate(async (sampleMapIn) => {
+        if (typeof window.samples !== "function") {
+          throw new Error("window.samples not available");
+        }
+        await window.samples(sampleMapIn);
+      }, sampleMap);
+
+      // Refresh samples list for completion.
+      await page.evaluate(() => window?.notifySamples?.());
+
+      const sanity = await page.evaluate(() => {
+        try {
+          const sm = window?.strudelMirror?.repl?.state?.soundMap;
+          const d = typeof sm?.get === "function" ? sm.get() : {};
+          return Object.keys(d || {}).length;
+        } catch {
+          return null;
+        }
+      });
+
+      const okPayload = {
+        importedKeys: Object.keys(sampleMap || {}).filter((k) => k !== "_base"),
+        soundCountAfter: sanity,
+      };
+
+      process.stdout.write(
+        MESSAGES.IMPORT_LOCAL_SAMPLES_OK +
+          Buffer.from(JSON.stringify(okPayload)).toString("base64") +
+          "\n",
+      );
+    } catch (e) {
+      process.stdout.write(
+        MESSAGES.IMPORT_LOCAL_SAMPLES_ERROR +
+          Buffer.from(String(e?.message || e)).toString("base64") +
+          "\n",
+      );
+    }
   }
 }
 
@@ -782,9 +837,9 @@ async function handleEvent(message) {
       try {
         const samples = await page.evaluate(() => {
           // Best-effort: this object shape may vary across Strudel versions.
-          const sm = window?.strudelMirror?.repl?.state?.soundMap;
-          const soundDict = typeof sm?.get === "function" ? sm.get() : {};
-          const soundNames = Object.keys(soundDict || {}).sort();
+          const sm = window?.soundMap;
+          const raw = typeof sm?.get === "function" ? sm.get() : sm;
+          const soundNames = Object.keys(raw || {}).sort();
 
           const banksSet = new Set();
           for (const key of soundNames) {

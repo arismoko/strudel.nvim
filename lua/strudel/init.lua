@@ -59,7 +59,109 @@ local config = {
     repo_url = "https://codeberg.org/uzu/strudel.git",
     repo_dir = vim.fn.stdpath("cache") .. "/strudel-nvim/strudel-src"
   },
+  local_samples = {
+    enabled = false,
+    preferred_dirs = { ".samples", "samples", ".sounds", "sounds" },
+    port = 0,
+  },
 }
+
+local local_samples_job_id = nil
+local local_samples_manifest_url = nil
+local local_samples_pending_import = false
+
+local function find_first_dir(candidates)
+  for _, p in ipairs(candidates) do
+    if type(p) == "string" and p ~= "" and vim.fn.isdirectory(p) == 1 then
+      return p
+    end
+  end
+  return nil
+end
+
+local function stop_local_samples_server()
+  if local_samples_job_id then
+    pcall(vim.fn.jobstop, local_samples_job_id)
+  end
+  local_samples_job_id = nil
+  local_samples_manifest_url = nil
+  local_samples_pending_import = false
+end
+
+local function start_local_samples_server(plugin_root)
+  stop_local_samples_server()
+
+  if not config.local_samples or not config.local_samples.enabled then
+    return
+  end
+
+  local cwd = vim.fn.getcwd()
+  local preferred = config.local_samples.preferred_dirs or { ".samples", "samples", ".sounds", "sounds" }
+  local candidates = {}
+  for _, name in ipairs(preferred) do
+    table.insert(candidates, cwd .. "/" .. name)
+  end
+
+  local root_dir = find_first_dir(candidates)
+  if not root_dir then
+    return
+  end
+
+  local script = plugin_root .. "/js/local_samples_server.js"
+  local args = {
+    "node",
+    script,
+    "--root=" .. root_dir,
+    "--port=" .. tostring(config.local_samples.port or 0),
+  }
+
+  local function on_stdout(_, data)
+    if not data then
+      return
+    end
+
+    for _, line in ipairs(data) do
+      if type(line) == "string" and line:match("^STRUDEL_LOCAL_SAMPLES_READY:") then
+        local b64 = line:sub(#"STRUDEL_LOCAL_SAMPLES_READY:" + 1)
+        local ok, decoded = pcall(base64.decode, b64)
+        if not ok then
+          vim.notify("Strudel local samples: failed to decode READY", vim.log.levels.WARN)
+          return
+        end
+
+        local ok2, payload = pcall(vim.json.decode, decoded)
+        if not ok2 or type(payload) ~= "table" then
+          vim.notify("Strudel local samples: invalid READY payload", vim.log.levels.WARN)
+          return
+        end
+
+        if type(payload.manifestUrl) == "string" then
+          local_samples_manifest_url = payload.manifestUrl
+
+          if strudel_job_id and local_samples_pending_import then
+            local payload2 = { manifestUrl = local_samples_manifest_url }
+            local b642 = base64.encode(vim.json.encode(payload2))
+            send_message("STRUDEL_IMPORT_LOCAL_SAMPLES:" .. b642)
+            local_samples_pending_import = false
+          end
+        end
+      elseif type(line) == "string" and line:match("^STRUDEL_LOCAL_SAMPLES_ERROR:") then
+        local b64 = line:sub(#"STRUDEL_LOCAL_SAMPLES_ERROR:" + 1)
+        local ok, decoded = pcall(base64.decode, b64)
+        if ok then
+          vim.notify("Strudel local samples error: " .. decoded, vim.log.levels.WARN)
+        else
+          vim.notify("Strudel local samples error", vim.log.levels.WARN)
+        end
+      end
+    end
+  end
+
+  local_samples_job_id = vim.fn.jobstart(args, {
+    on_stdout = on_stdout,
+    on_stderr = on_stdout,
+  })
+end
 
 local function send_message(message)
   if strudel_job_id then
@@ -70,6 +172,27 @@ local function send_message(message)
 end
 local function set_samples(samples)
   stored_samples = samples
+end
+
+function M.import_local_samples()
+  if not strudel_job_id then
+    vim.notify("No active Strudel session", vim.log.levels.WARN)
+    return
+  end
+
+  if local_samples_manifest_url then
+    local payload = { manifestUrl = local_samples_manifest_url }
+    local b64 = base64.encode(vim.json.encode(payload))
+    send_message("STRUDEL_IMPORT_LOCAL_SAMPLES:" .. b64)
+    return
+  end
+
+  if local_samples_job_id then
+    local_samples_pending_import = true
+    vim.notify("Strudel local samples: waiting for server...", vim.log.levels.INFO)
+  else
+    vim.notify("Strudel local samples: no samples folder detected", vim.log.levels.INFO)
+  end
 end
 
 local function notify_lsp_samples(samples)
@@ -178,6 +301,15 @@ end
 local function handle_event(full_data)
   if full_data:match("^" .. MESSAGES.READY) then
     strudel_ready = true
+
+    if local_samples_manifest_url then
+      local payload = { manifestUrl = local_samples_manifest_url }
+      local b64 = base64.encode(vim.json.encode(payload))
+      send_message("STRUDEL_IMPORT_LOCAL_SAMPLES:" .. b64)
+    elseif local_samples_job_id then
+      local_samples_pending_import = true
+    end
+
     if strudel_synced_bufnr then
       start_lsp(strudel_synced_bufnr)
       send_buffer_content()
@@ -219,6 +351,29 @@ local function handle_event(full_data)
       set_samples(samples)
       notify_lsp_samples(samples)
     end
+  elseif full_data:match("^STRUDEL_IMPORT_LOCAL_SAMPLES_OK:") then
+    local b64 = full_data:sub(#"STRUDEL_IMPORT_LOCAL_SAMPLES_OK:" + 1)
+    local decoded = base64.decode(b64)
+    local ok, payload = pcall(vim.json.decode, decoded)
+
+    vim.schedule(function()
+      if ok and type(payload) == "table" and type(payload.importedKeys) == "table" then
+        vim.notify(
+          string.format(
+            "Strudel local samples: imported %d sounds (soundMap now %s)",
+            #payload.importedKeys,
+            tostring(payload.soundCountAfter or "?")),
+          vim.log.levels.INFO)
+      else
+        vim.notify("Strudel local samples: imported", vim.log.levels.INFO)
+      end
+    end)
+  elseif full_data:match("^STRUDEL_IMPORT_LOCAL_SAMPLES_ERROR:") then
+    local b64 = full_data:sub(#"STRUDEL_IMPORT_LOCAL_SAMPLES_ERROR:" + 1)
+    local decoded = base64.decode(b64)
+    vim.schedule(function()
+      vim.notify("Strudel local samples import failed: " .. decoded, vim.log.levels.WARN)
+    end)
   elseif full_data:match("^" .. MESSAGES.EVAL_ERROR) then
     local error_b64 = full_data:sub(#MESSAGES.EVAL_ERROR + 1)
     local error = base64.decode(error_b64)
@@ -268,11 +423,46 @@ function M.setup(opts)
   -- Create autocmd group
   vim.api.nvim_create_augroup(STRUDEL_SYNC_AUTOCOMMAND, { clear = true })
 
+  local function strudel_preferred_hover()
+    local bufnr = vim.api.nvim_get_current_buf()
+    local params = vim.lsp.util.make_position_params()
+
+    for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+      if client.name == "strudel" then
+        client.request("textDocument/hover", params, function(err, result)
+          if err or not result then
+            return
+          end
+
+          local lines = vim.lsp.util.convert_input_to_markdown_lines(result.contents)
+          lines = vim.lsp.util.trim_empty_lines(lines)
+          if not lines or vim.tbl_isempty(lines) then
+            return
+          end
+
+          vim.lsp.util.open_floating_preview(lines, "markdown", { border = "rounded" })
+        end, bufnr)
+        return
+      end
+    end
+
+    vim.lsp.buf.hover()
+  end
+
   -- Set file type for .str, .std files to JavaScript
   vim.api.nvim_create_autocmd({ "BufRead", "BufNewFile" }, {
     pattern = { "*.str", "*.std" },
-    callback = function()
+    callback = function(ev)
       vim.bo.filetype = "javascript"
+
+      -- Prefer Strudel's LSP hover docs over JS/TS type hover.
+      vim.keymap.set("n", "K", strudel_preferred_hover, { buffer = ev.buf, silent = true })
+
+      if strudel_job_id == nil then
+        vim.schedule(function()
+          vim.notify("Strudel session not running. Use :StrudelLaunch", vim.log.levels.INFO)
+        end)
+      end
     end,
   })
 
@@ -284,6 +474,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("StrudelStop", M.stop, {})
   vim.api.nvim_create_user_command("StrudelSetBuffer", M.set_buffer, { nargs = "?" })
   vim.api.nvim_create_user_command("StrudelExecute", M.execute, {})
+  vim.api.nvim_create_user_command("StrudelImportLocalSamples", M.import_local_samples, {})
 end
 
 function M.launch()
@@ -293,6 +484,8 @@ function M.launch()
   end
 
   local plugin_root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h")
+  start_local_samples_server(plugin_root)
+
   local launch_script = plugin_root .. "/js/launch.js"
   local cmd = "node " .. vim.fn.shellescape(launch_script)
 
@@ -394,6 +587,8 @@ function M.launch()
         vim.notify("Strudel process error: " .. code, vim.log.levels.ERROR)
       end
 
+      stop_local_samples_server()
+
       -- reset state
       strudel_ready = false
       strudel_job_id = nil
@@ -413,6 +608,7 @@ function M.is_launched()
 end
 
 function M.quit()
+  stop_local_samples_server()
   send_message(MESSAGES.QUIT)
 end
 
@@ -425,6 +621,7 @@ function M.update()
 end
 
 function M.stop()
+  stop_local_samples_server()
   send_message(MESSAGES.STOP)
 end
 
