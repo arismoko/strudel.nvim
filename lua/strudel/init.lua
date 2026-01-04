@@ -232,6 +232,7 @@ local function start_lsp(bufnr)
     name = "strudel",
     cmd = cmd,
     root_dir = plugin_root,
+    bufnr = bufnr,
   })
 
   if ok then
@@ -423,45 +424,65 @@ function M.setup(opts)
   -- Create autocmd group
   vim.api.nvim_create_augroup(STRUDEL_SYNC_AUTOCOMMAND, { clear = true })
 
-  local function strudel_preferred_hover()
-    local bufnr = vim.api.nvim_get_current_buf()
-    local params = vim.lsp.util.make_position_params()
-
-    for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
-      if client.name == "strudel" then
-        client.request("textDocument/hover", params, function(err, result)
-          if err or not result then
-            return
-          end
-
-          local lines = vim.lsp.util.convert_input_to_markdown_lines(result.contents)
-          lines = vim.lsp.util.trim_empty_lines(lines)
-          if not lines or vim.tbl_isempty(lines) then
-            return
-          end
-
-          vim.lsp.util.open_floating_preview(lines, "markdown", { border = "rounded" })
-        end, bufnr)
-        return
-      end
-    end
-
-    vim.lsp.buf.hover()
+  local function is_strudel_buf(bufnr)
+    local name = vim.api.nvim_buf_get_name(bufnr)
+    return name:match("%.str$") or name:match("%.std$")
   end
 
-  -- Set file type for .str, .std files to JavaScript
+  -- .str/.std use a dedicated ft so JS/TS LSPs don't auto-attach.
   vim.api.nvim_create_autocmd({ "BufRead", "BufNewFile" }, {
     pattern = { "*.str", "*.std" },
     callback = function(ev)
-      vim.bo.filetype = "javascript"
-
-      -- Prefer Strudel's LSP hover docs over JS/TS type hover.
-      vim.keymap.set("n", "K", strudel_preferred_hover, { buffer = ev.buf, silent = true })
+      vim.bo[ev.buf].filetype = "strudel"
 
       if strudel_job_id == nil then
         vim.schedule(function()
           vim.notify("Strudel session not running. Use :StrudelLaunch", vim.log.levels.INFO)
         end)
+      end
+    end,
+  })
+
+
+  -- Provide JavaScript syntax highlighting while keeping ft=strudel.
+  vim.api.nvim_create_autocmd("FileType", {
+    group = STRUDEL_SYNC_AUTOCOMMAND,
+    pattern = "strudel",
+    callback = function(ev)
+      -- Defer so we run after Neovim's default `:syntax on` machinery
+      -- (which otherwise resets `&l:syntax` back to the filetype).
+      vim.defer_fn(function()
+        if not vim.api.nvim_buf_is_valid(ev.buf) then
+          return
+        end
+        vim.b[ev.buf].current_syntax = nil
+        vim.cmd("setlocal syntax=javascript")
+      end, 0)
+    end,
+  })
+  -- Prevent unrelated LSPs from attaching and reporting bogus diagnostics.
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = STRUDEL_SYNC_AUTOCOMMAND,
+    callback = function(ev)
+      if not is_strudel_buf(ev.buf) then
+        return
+      end
+
+      local client = vim.lsp.get_client_by_id(ev.data.client_id)
+      if not client then
+        return
+      end
+
+      -- Only the Strudel LSP should stay attached.
+      -- Detach other clients after LspAttach finishes to avoid a
+      -- Neovim 0.11 change-tracking race.
+      if client.name ~= "strudel" then
+        vim.defer_fn(function()
+          if vim.api.nvim_buf_is_valid(ev.buf) then
+            pcall(vim.lsp.buf_detach_client, ev.buf, client.id)
+          end
+        end, 0)
+        return
       end
     end,
   })
@@ -626,7 +647,10 @@ function M.stop()
 end
 
 function M.set_buffer(opts)
-  vim.api.nvim_clear_autocmds({ group = STRUDEL_SYNC_AUTOCOMMAND })
+  -- Only clear buffer-local sync autocmds; keep the global LspAttach filter.
+  if strudel_synced_bufnr and vim.api.nvim_buf_is_valid(strudel_synced_bufnr) then
+    vim.api.nvim_clear_autocmds({ group = STRUDEL_SYNC_AUTOCOMMAND, buffer = strudel_synced_bufnr })
+  end
 
   if not strudel_job_id then
     vim.notify("No active Strudel session", vim.log.levels.WARN)
@@ -640,6 +664,7 @@ function M.set_buffer(opts)
   end
 
   strudel_synced_bufnr = bufnr
+
   send_buffer_content()
 
   -- Set up autocommand to sync buffer changes
