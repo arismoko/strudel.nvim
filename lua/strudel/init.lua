@@ -12,7 +12,6 @@ local MESSAGES = {
   READY = "STRUDEL_READY",
   CURSOR = "STRUDEL_CURSOR:",
   EVAL_ERROR = "STRUDEL_EVAL_ERROR:",
-  COMPLETIONS = "STRUDEL_COMPLETIONS:",
   SAMPLES = "STRUDEL_SAMPLES:"
 }
 
@@ -26,12 +25,13 @@ local strudel_synced_bufnr = nil
 local strudel_ready = false
 local custom_css_b64 = nil
 local last_received_cursor = nil -- {row, col}
+local lsp_started = false
+local doc_json_path = nil
 
 -- Event queue for sequential message processing
 local event_queue = {}
 local is_processing_event = false
 
-local stored_completions = nil
 local stored_samples = nil
 -- Config with default options
 local config = {
@@ -43,6 +43,9 @@ local config = {
     hide_error_display = false,
     custom_css_file = nil,
   },
+  lsp = {
+    enabled = true,
+  },
   report_eval_errors = true,
   sync_cursor = true,
   start_on_launch = true,
@@ -50,6 +53,12 @@ local config = {
   headless = false,
   browser_data_dir = nil,
   browser_exec_path = nil,
+  browser_remote_debug_port = 9222,
+  local_server = {
+    enabled = true,
+    repo_url = "https://codeberg.org/uzu/strudel.git",
+    repo_dir = vim.fn.stdpath("cache") .. "/strudel-nvim/strudel-src"
+  },
 }
 
 local function send_message(message)
@@ -59,10 +68,6 @@ local function send_message(message)
     vim.notify("No active Strudel session", vim.log.levels.WARN)
   end
 end
-local function set_completions(completions)
-  stored_completions = completions
-end
-
 local function set_samples(samples)
   stored_samples = samples
 end
@@ -76,6 +81,41 @@ local function notify_lsp_samples(samples)
     pcall(function()
       c.notify("strudel/samples", samples)
     end)
+  end
+end
+
+local function start_lsp(bufnr)
+  if lsp_started or not config.lsp.enabled then
+    return
+  end
+
+  if not doc_json_path then
+    vim.notify("Strudel: doc.json not ready; LSP disabled", vim.log.levels.WARN)
+    return
+  end
+
+  local plugin_root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h")
+  local server = plugin_root .. "/dist/lsp/server.js"
+
+  local cmd = {
+    "node",
+    server,
+    "--stdio",
+    "--doc-json-path",
+    doc_json_path,
+  }
+
+  local ok = pcall(vim.lsp.start, {
+    name = "strudel",
+    cmd = cmd,
+    root_dir = plugin_root,
+  })
+
+  if ok then
+    lsp_started = true
+
+    -- If we already received samples before LSP started, replay them.
+    notify_lsp_samples(stored_samples)
   end
 end
 local function send_cursor_position()
@@ -139,6 +179,7 @@ local function handle_event(full_data)
   if full_data:match("^" .. MESSAGES.READY) then
     strudel_ready = true
     if strudel_synced_bufnr then
+      start_lsp(strudel_synced_bufnr)
       send_buffer_content()
       if config.start_on_launch then
         vim.defer_fn(function()
@@ -170,6 +211,14 @@ local function handle_event(full_data)
         vim.api.nvim_win_set_cursor(0, { clamped_row, clamped_col })
       end)
     end
+  elseif full_data:match("^" .. MESSAGES.SAMPLES) then
+    local samples_b64 = full_data:sub(#MESSAGES.SAMPLES + 1)
+    local decoded = base64.decode(samples_b64)
+    local ok, samples = pcall(vim.json.decode, decoded)
+    if ok and type(samples) == "table" then
+      set_samples(samples)
+      notify_lsp_samples(samples)
+    end
   elseif full_data:match("^" .. MESSAGES.EVAL_ERROR) then
     local error_b64 = full_data:sub(#MESSAGES.EVAL_ERROR + 1)
     local error = base64.decode(error_b64)
@@ -178,26 +227,7 @@ local function handle_event(full_data)
         vim.notify("Strudel Error: " .. error, vim.log.levels.ERROR)
       end)
     end
-  elseif full_data:match("^" .. MESSAGES.COMPLETIONS) then
-    local comp_b64 = full_data:sub(#MESSAGES.COMPLETIONS + 1)
-    local comp_content = base64.decode(comp_b64)
-    local ok, content = pcall(function()
-      return vim.json.decode(comp_content)
-    end
-    )
-    if not ok then
-      local err = content
-      vim.notify("Strudel Completions error: " .. err, vim.log.levels.ERROR)
-    else
-      set_completions(content)
-    end
   end
-end
-
-
-
-function M.get_completions()
-  return stored_completions or {}
 end
 
 local function process_event_queue()
@@ -266,6 +296,15 @@ function M.launch()
   local launch_script = plugin_root .. "/js/launch.js"
   local cmd = "node " .. vim.fn.shellescape(launch_script)
 
+  doc_json_path = vim.fn.stdpath("cache") .. "/strudel-nvim/doc.json"
+  cmd = cmd .. " --doc-json-out=" .. vim.fn.shellescape(doc_json_path)
+
+  if config.local_server.enabled then
+    cmd = cmd .. " --local-server"
+    cmd = cmd .. " --repo-url=" .. vim.fn.shellescape(config.local_server.repo_url)
+    cmd = cmd .. " --repo-dir=" .. vim.fn.shellescape(config.local_server.repo_dir)
+  end
+
   if config.ui.hide_top_bar then
     cmd = cmd .. " --hide-top-bar"
   end
@@ -294,6 +333,33 @@ function M.launch()
     cmd = cmd .. " --browser-exec-path=" .. vim.fn.shellescape(config.browser_exec_path)
   end
 
+  -- Enable remote debugging so external tools can inspect Strudel runtime.
+  -- Default to 9222 unless explicitly disabled.
+  local rd_port = config.browser_remote_debug_port
+  if rd_port == nil then
+    rd_port = 9222
+  end
+  if type(rd_port) == "number" and rd_port > 0 then
+    cmd = cmd .. " --remote-debug-port=" .. tostring(rd_port)
+  end
+
+  local function is_noise_line(line)
+    return line:match("^%s*$")
+      or line:match("^Browserslist:%s")
+      or line:match("^%d%d:%d%d:%d%d")
+      or line:match("^%s*astro%s+")
+      or line:match("^┃%s")
+      or line:match("^>%s")
+  end
+
+  local function is_real_error_line(line)
+    -- Heuristic: only escalate obvious failures.
+    return line:lower():match("error")
+      or line:lower():match("failed")
+      or line:lower():match("exception")
+      or line:lower():match("traceback")
+  end
+
   -- Run the js script
   strudel_job_id = vim.fn.jobstart(cmd, {
     on_stderr = function(_, data)
@@ -302,8 +368,9 @@ function M.launch()
       end
 
       for _, line in ipairs(data) do
-        if line ~= "" then
-          vim.notify("Strudel Process Error: " .. line, vim.log.levels.ERROR)
+        if line ~= "" and not is_noise_line(line) then
+          local level = is_real_error_line(line) and vim.log.levels.ERROR or vim.log.levels.INFO
+          vim.notify("Strudel: " .. line, level)
         end
       end
     end,
@@ -333,6 +400,8 @@ function M.launch()
       last_content = nil
       strudel_synced_bufnr = nil
       last_received_cursor = nil
+      lsp_started = false
+      doc_json_path = nil
     end,
   })
 

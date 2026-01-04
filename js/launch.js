@@ -1,8 +1,10 @@
 const puppeteer = require("puppeteer");
+const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { spawn } = require("child_process");
 
-const STRUDEL_URL = "https://strudel.cc/";
+const DEFAULT_REPO_URL = "https://codeberg.org/uzu/strudel.git";
 
 const MESSAGES = {
   CONTENT: "STRUDEL_CONTENT:",
@@ -14,7 +16,7 @@ const MESSAGES = {
   READY: "STRUDEL_READY",
   CURSOR: "STRUDEL_CURSOR:",
   EVAL_ERROR: "STRUDEL_EVAL_ERROR:",
-  COMPLETIONS: "STRUDEL_COMPLETIONS:",
+  SAMPLES: "STRUDEL_SAMPLES:",
 };
 
 const SELECTORS = {
@@ -84,6 +86,12 @@ const CLI_ARGS = {
   HEADLESS: "--headless",
   USER_DATA_DIR: "--user-data-dir=",
   BROWSER_EXEC_PATH: "--browser-exec-path=",
+  DOC_JSON_OUT: "--doc-json-out=",
+  LOCAL_SERVER: "--local-server",
+  REPO_URL: "--repo-url=",
+  REPO_DIR: "--repo-dir=",
+  PORT: "--port=",
+  REMOTE_DEBUG_PORT: "--remote-debug-port=",
 };
 
 const userConfig = {
@@ -96,6 +104,12 @@ const userConfig = {
   isHeadless: false,
   userDataDir: null,
   browserExecPath: null,
+  docJsonOut: null,
+  localServer: false,
+  repoUrl: DEFAULT_REPO_URL,
+  repoDir: null,
+  port: 0,
+  remoteDebugPort: 0,
 };
 
 // Process program arguments at launch
@@ -125,10 +139,26 @@ for (const arg of process.argv) {
     userConfig.browserExecPath = path.join(
       arg.replace(CLI_ARGS.BROWSER_EXEC_PATH, ""),
     );
+  } else if (arg.startsWith(CLI_ARGS.DOC_JSON_OUT)) {
+    userConfig.docJsonOut = path.join(arg.replace(CLI_ARGS.DOC_JSON_OUT, ""));
+  } else if (arg === CLI_ARGS.LOCAL_SERVER) {
+    userConfig.localServer = true;
+  } else if (arg.startsWith(CLI_ARGS.REPO_URL)) {
+    userConfig.repoUrl = arg.replace(CLI_ARGS.REPO_URL, "");
+  } else if (arg.startsWith(CLI_ARGS.REPO_DIR)) {
+    userConfig.repoDir = path.join(arg.replace(CLI_ARGS.REPO_DIR, ""));
+  } else if (arg.startsWith(CLI_ARGS.PORT)) {
+    userConfig.port = Number(arg.replace(CLI_ARGS.PORT, "")) || 0;
+  } else if (arg.startsWith(CLI_ARGS.REMOTE_DEBUG_PORT)) {
+    userConfig.remoteDebugPort =
+      Number(arg.replace(CLI_ARGS.REMOTE_DEBUG_PORT, "")) || 0;
   }
 }
 if (!userConfig.userDataDir) {
   userConfig.userDataDir = path.join(os.homedir(), ".cache", "strudel-nvim");
+}
+if (!userConfig.repoDir) {
+  userConfig.repoDir = path.join(userConfig.userDataDir, "strudel-src");
 }
 
 // Returns path with expansion of "~" or "~/" to the user's home directory
@@ -144,15 +174,304 @@ function expandTilde(p) {
 // Apply tilde home expansion
 userConfig.userDataDir = expandTilde(userConfig.userDataDir);
 userConfig.browserExecPath = expandTilde(userConfig.browserExecPath);
+userConfig.repoDir = expandTilde(userConfig.repoDir);
 
 // State
 let page = null;
 let lastContent = null;
 let browser = null;
+let serverProc = null;
 
 // Event queue for sequential message processing
 const eventQueue = [];
 let isProcessingEvent = false;
+
+function fileExists(p) {
+  try {
+    fs.accessSync(p, fs.constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runCommand(command, args, opts = {}) {
+  const { timeoutMs = 0, ...spawnOpts } = opts;
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      ...spawnOpts,
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    const onData = (buf, isErr) => {
+      const s = buf.toString();
+      if (isErr) {
+        stderr += s;
+      } else {
+        stdout += s;
+      }
+    };
+
+    proc.stdout.on("data", (d) => onData(d, false));
+    proc.stderr.on("data", (d) => onData(d, true));
+
+    let timer = null;
+    if (timeoutMs && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        try {
+          proc.kill("SIGTERM");
+        } catch {
+          // ignore
+        }
+        reject(new Error(`${command} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
+
+    proc.on("error", (err) => {
+      if (timer) clearTimeout(timer);
+      reject(err);
+    });
+
+    proc.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+async function ensureRepo(repoDir, repoUrl) {
+  const gitDir = path.join(repoDir, ".git");
+  if (!fileExists(gitDir)) {
+    console.error("[strudel.nvim] cloning repo...", repoUrl);
+    fs.mkdirSync(path.dirname(repoDir), { recursive: true });
+    const res = await runCommand(
+      "git",
+      ["clone", "--depth", "1", repoUrl, repoDir],
+      { timeoutMs: 5 * 60 * 1000 },
+    );
+    if (res.code !== 0) {
+      throw new Error(
+        `git clone failed (repo: ${repoUrl}, dir: ${repoDir}): ${res.stderr || res.stdout}`,
+      );
+    }
+    return;
+  }
+
+  // Best effort update: failure falls back to cached repo.
+  console.error("[strudel.nvim] updating cached repo...");
+  const fetchRes = await runCommand(
+    "git",
+    ["-C", repoDir, "fetch", "--all", "--prune"],
+    { timeoutMs: 2 * 60 * 1000 },
+  );
+  if (fetchRes.code !== 0) {
+    console.error("git fetch failed; using cached repo:", fetchRes.stderr || fetchRes.stdout);
+    return;
+  }
+
+  const pullRes = await runCommand(
+    "git",
+    ["-C", repoDir, "pull", "--ff-only"],
+    { timeoutMs: 2 * 60 * 1000 },
+  );
+  if (pullRes.code !== 0) {
+    console.error("git pull failed; using cached repo:", pullRes.stderr || pullRes.stdout);
+  }
+}
+
+async function ensurePnpmInstall(repoDir) {
+  // We only need dependencies installed for running the website dev server.
+  // Keep installation scoped to the website package to minimize work.
+  const websiteDir = path.join(repoDir, "website");
+  const websiteNodeModules = path.join(websiteDir, "node_modules");
+  if (fileExists(websiteNodeModules)) {
+    return;
+  }
+
+  console.error("[strudel.nvim] installing website deps (pnpm)...");
+  const res = await runCommand("pnpm", ["install"], {
+    cwd: websiteDir,
+    timeoutMs: 10 * 60 * 1000,
+  });
+  if (res.code !== 0) {
+    throw new Error(`pnpm install failed: ${res.stderr || res.stdout}`);
+  }
+}
+
+async function getRepoHead(repoDir) {
+  const res = await runCommand("git", ["-C", repoDir, "rev-parse", "HEAD"], {
+    timeoutMs: 30 * 1000,
+  });
+  if (res.code !== 0) {
+    throw new Error(`git rev-parse HEAD failed: ${res.stderr || res.stdout}`);
+  }
+  return (res.stdout || "").trim();
+}
+
+function writeJsonFileAtomic(p, data) {
+  const tmp = p + ".tmp";
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(tmp, JSON.stringify(data), "utf8");
+  fs.renameSync(tmp, p);
+}
+
+async function ensureDocJson(repoDir, outPath) {
+  if (!outPath) {
+    throw new Error("--doc-json-out is required");
+  }
+
+  const metaPath = outPath + ".meta.json";
+  const head = await getRepoHead(repoDir);
+
+  // If cached doc exists and commit hash matches, skip regeneration.
+  if (fileExists(outPath) && fileExists(metaPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+      if (meta && meta.head === head) {
+        console.error("[strudel.nvim] doc.json cache hit:", head);
+        return;
+      }
+    } catch {
+      // ignore parse errors, regenerate
+    }
+  }
+
+  console.error("[strudel.nvim] generating doc.json (pnpm run jsdoc-json)...");
+
+  const env = {
+    ...process.env,
+    PATH:
+      path.join(repoDir, "node_modules", ".bin") +
+      path.delimiter +
+      (process.env.PATH || ""),
+  };
+
+  const res = await runCommand("pnpm", ["run", "jsdoc-json"], {
+    cwd: repoDir,
+    env,
+    timeoutMs: 10 * 60 * 1000,
+  });
+  if (res.code !== 0) {
+    throw new Error(`pnpm run jsdoc-json failed: ${res.stderr || res.stdout}`);
+  }
+
+  await exportDocJsonFromRepo(outPath, repoDir);
+  writeJsonFileAtomic(metaPath, { head, generatedAt: new Date().toISOString() });
+}
+
+async function waitForHttp(url, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await fetch(url, { method: "GET" });
+      if (res && res.ok) return;
+    } catch {
+      // ignore
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error("Timed out waiting for server: " + url);
+}
+
+async function startLocalServer(repoDir, portHint) {
+  const websiteDir = path.join(repoDir, "website");
+  if (!fileExists(websiteDir)) {
+    throw new Error("Strudel website dir missing: " + websiteDir);
+  }
+
+  // Use astro directly instead of `pnpm run dev` because the pnpm script
+  // currently injects its own `--host 0.0.0.0`, and multiple hosts lead to
+  // confusing bindings (e.g. listening only on ::1).
+  const args = ["node", path.join(websiteDir, "node_modules", "astro", "astro.js"), "dev", "--host", "127.0.0.1"];
+  if (portHint && portHint > 0) {
+    args.push("--port", String(portHint));
+  }
+
+  const [cmd, ...cmdArgs] = args;
+  serverProc = spawn(cmd, cmdArgs, {
+    cwd: websiteDir,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      HOST: "127.0.0.1",
+    },
+  });
+
+  let serverUrl = null;
+  const onLine = (line) => {
+    // Astro prints something like:
+    //   "Local    http://localhost:4321/"
+    // Vite sometimes prints:
+    //   "➜  Local:   http://localhost:5173/"
+    // And in some setups it can still report 0.0.0.0.
+    const m = line.match(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0):\d+\/?/i);
+    if (m) {
+      serverUrl = m[0]
+        .replace("localhost", "127.0.0.1")
+        .replace("0.0.0.0", "127.0.0.1");
+    }
+  };
+
+  serverProc.stdout.on("data", (d) => {
+    const s = d.toString();
+    // Astro's output uses box-drawing characters; keep the raw text for debugging.
+    process.stderr.write(s);
+    for (const line of s.split(/\r?\n/)) {
+      if (line) onLine(line);
+    }
+  });
+  serverProc.stderr.on("data", (d) => {
+    const s = d.toString();
+    process.stderr.write(s);
+    for (const line of s.split(/\r?\n/)) {
+      if (line) onLine(line);
+    }
+  });
+
+  serverProc.on("exit", (code) => {
+    if (code && code !== 0) {
+      console.error("Strudel local server exited with code:", code);
+    }
+  });
+
+  const startedAt = Date.now();
+  while (!serverUrl && Date.now() - startedAt < 30000) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!serverUrl) {
+    shutdownLocalServer();
+    throw new Error(
+      "Failed to determine local server URL from pnpm output (timed out after 30s)",
+    );
+  }
+
+  await waitForHttp(serverUrl);
+  return serverUrl;
+}
+
+function shutdownLocalServer() {
+  if (!serverProc) return;
+  try {
+    serverProc.kill("SIGTERM");
+  } catch {
+    // ignore
+  }
+  serverProc = null;
+}
+
+process.on("exit", () => shutdownLocalServer());
+process.on("SIGINT", () => {
+  shutdownLocalServer();
+  process.exit(1);
+});
+process.on("SIGTERM", () => {
+  shutdownLocalServer();
+  process.exit(1);
+});
 
 async function updateEditorContent(content) {
   if (!page) return;
@@ -238,15 +557,28 @@ async function handleCursorMessage(message) {
     { row, col },
   );
 }
-async function sendCompletions(page) {
-  const scope = await page.evaluate(() => {
-    return Object.keys(globalThis.strudelScope ?? {});
-  });
-  process.stdout.write(
-    MESSAGES.COMPLETIONS +
-      Buffer.from(JSON.stringify(scope), "utf8").toString("base64") +
-      "\n",
-  );
+
+function safeWriteFile(outPath, content) {
+  try {
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, content, "utf8");
+    return true;
+  } catch (e) {
+    console.error("Failed to write file:", outPath, e);
+    return false;
+  }
+}
+
+async function exportDocJsonFromRepo(outPath, repoDir) {
+  if (!outPath) return;
+  const p = path.join(repoDir, "doc.json");
+  const raw = fs.readFileSync(p, "utf8");
+  // Ensure we keep the shape {docs:[...]}
+  const parsed = JSON.parse(raw);
+  if (!parsed || !Array.isArray(parsed.docs)) {
+    throw new Error("Invalid doc.json (missing docs[]) at: " + p);
+  }
+  safeWriteFile(outPath, JSON.stringify({ docs: parsed.docs }, null, 2));
 }
 // Handle messages from Neovim
 process.stdin.on("data", (data) => {
@@ -273,6 +605,7 @@ async function processEventQueue() {
 
 async function handleEvent(message) {
   if (message === MESSAGES.QUIT) {
+    shutdownLocalServer();
     if (browser) {
       await browser.close();
       process.exit(0);
@@ -311,14 +644,34 @@ async function handleEvent(message) {
 // Initialize browser and set up event handlers
 (async () => {
   try {
+    if (!userConfig.localServer) {
+      throw new Error(
+        "Local server mode is required. Pass --local-server to launch.js.",
+      );
+    }
+
+    console.error("[strudel.nvim] ensureRepo...", userConfig.repoDir);
+    await ensureRepo(userConfig.repoDir, userConfig.repoUrl);
+
+    console.error("[strudel.nvim] ensurePnpmInstall...");
+    await ensurePnpmInstall(userConfig.repoDir);
+
+    console.error("[strudel.nvim] ensureDocJson...");
+    await ensureDocJson(userConfig.repoDir, userConfig.docJsonOut);
+    const strudelUrl = await startLocalServer(userConfig.repoDir, userConfig.port);
+
+
     browser = await puppeteer.launch({
       headless: userConfig.isHeadless,
       defaultViewport: null,
       userDataDir: userConfig.userDataDir,
       ignoreDefaultArgs: ["--mute-audio", "--enable-automation"],
       args: [
-        `--app=${STRUDEL_URL}`,
+        `--app=${strudelUrl}`,
         "--autoplay-policy=no-user-gesture-required",
+        ...(userConfig.remoteDebugPort
+          ? [`--remote-debugging-port=${userConfig.remoteDebugPort}`]
+          : []),
       ],
       ...(userConfig.browserExecPath && {
         executablePath: userConfig.browserExecPath,
@@ -424,6 +777,49 @@ async function handleEvent(message) {
       );
     }
 
+    // Handle samples reporting (for LSP completion)
+    await page.exposeFunction("notifySamples", async () => {
+      try {
+        const samples = await page.evaluate(() => {
+          // Best-effort: this object shape may vary across Strudel versions.
+          const sm = window?.strudelMirror?.repl?.state?.soundMap;
+          const soundDict = typeof sm?.get === "function" ? sm.get() : {};
+          const soundNames = Object.keys(soundDict || {}).sort();
+
+          const banksSet = new Set();
+          for (const key of soundNames) {
+            const [bank, suffix] = key.split("_");
+            if (suffix && bank) banksSet.add(bank);
+          }
+
+          return { soundNames, banks: Array.from(banksSet).sort() };
+        });
+
+        const b64 = Buffer.from(JSON.stringify(samples)).toString("base64");
+        process.stdout.write(MESSAGES.SAMPLES + b64 + "\n");
+      } catch {
+        // ignore
+      }
+    });
+
+    // Try to emit samples periodically (pages may load soundMap later).
+    await page.evaluate(() => {
+      let sentOnce = false;
+      setInterval(() => {
+        try {
+          if (!sentOnce) {
+            const sm = window?.strudelMirror?.repl?.state?.soundMap;
+            if (sm && typeof sm.get === "function") {
+              sentOnce = true;
+            }
+          }
+          window?.notifySamples?.();
+        } catch {
+          // ignore
+        }
+      }, 1000);
+    });
+
     // Handle eval errors reporting
     await page.exposeFunction("notifyEvalError", (evalErrorMessage) => {
       if (evalErrorMessage) {
@@ -470,9 +866,9 @@ async function handleEvent(message) {
       }, SELECTORS.EDITOR);
     }
 
+
     // Signal that browser is ready
     process.stdout.write(MESSAGES.READY + "\n");
-    await sendCompletions(page);
   } catch (error) {
     console.error("Error:", error);
     process.exit(1);

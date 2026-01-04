@@ -4,6 +4,7 @@
   "description": "Launch and control Strudel from Neovim",
   "main": "js/launch.js",
   "dependencies": {
+    "@strudel/tonal": "^1.2.3",
     "puppeteer": "^22.4.1",
     "vscode-languageserver": "^9.0.1",
     "vscode-languageserver-textdocument": "^1.0.11"
@@ -30,5 +31,6 @@
     "build": "tsc -p tsconfig.json",
     "lsp": "node dist/lsp/server.js --stdio"
   },
+
   "license": "AGPL-3.0"
 }
