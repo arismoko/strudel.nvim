@@ -5,6 +5,7 @@
   "main": "js/launch.js",
   "dependencies": {
     "@strudel/tonal": "^1.2.3",
+    "acorn": "^8.14.0",
     "puppeteer": "^22.4.1",
     "vscode-languageserver": "^9.0.1",
     "vscode-languageserver-textdocument": "^1.0.11"

@@ -6,6 +6,8 @@ import path from "path";
 import {
   CompletionItemKind,
   createConnection,
+  Diagnostic,
+  DiagnosticSeverity,
   MarkupKind,
   ProposedFeatures,
   TextDocumentPositionParams,
@@ -17,6 +19,8 @@ import {
 import { TextDocument } from "vscode-languageserver-textdocument";
 
 import { buildMarkdownDoc, buildDocIndex, complete } from "./cm_engine.js";
+
+import { parse } from "acorn";
 
 function usageAndExit() {
   process.stderr.write(
@@ -131,6 +135,27 @@ const documents = new TextDocuments(TextDocument);
 
 documents.listen(connection);
 
+documents.onDidOpen((e) => {
+  void validateDocument(e.document);
+});
+
+documents.onDidChangeContent((e) => {
+  // Track latest version so stale scheduled validations don't publish.
+  lastKnownVersionByUri.set(e.document.uri, e.document.version);
+  scheduleValidation(e.document.uri, 150);
+});
+
+documents.onDidClose((e) => {
+  const uri = e.document.uri;
+
+  connection.sendDiagnostics({ uri, diagnostics: [] });
+
+  const t = debounceTimersByUri.get(uri);
+  if (t) clearTimeout(t);
+  debounceTimersByUri.delete(uri);
+  lastKnownVersionByUri.delete(uri);
+});
+
 connection.onInitialize(() => {
   return {
     capabilities: {
@@ -143,6 +168,80 @@ connection.onInitialize(() => {
     },
   };
 });
+
+function syntaxDiagnosticsFromError(err: unknown): Diagnostic[] | null {
+  if (!err || typeof err !== "object") return null;
+
+  const message = (err as any).message;
+  const loc = (err as any).loc as { line: number; column: number } | undefined;
+
+  // Only surface acorn-style parse errors (SyntaxError with `loc`).
+  if (typeof message !== "string" || !message) return null;
+  if (typeof loc?.line !== "number" || typeof loc?.column !== "number") return null;
+
+  const line = Math.max(0, loc.line - 1);
+  const character = Math.max(0, loc.column);
+
+  return [
+    {
+      severity: DiagnosticSeverity.Error,
+      message,
+      range: {
+        start: { line, character },
+        // Zero-length range avoids off-by-one highlights near EOF.
+        end: { line, character },
+      },
+      source: "strudel",
+    },
+  ];
+}
+
+const lastKnownVersionByUri = new Map<string, number>();
+
+function scheduleValidation(uri: string, delayMs: number) {
+  const existing = debounceTimersByUri.get(uri);
+  if (existing) clearTimeout(existing);
+
+  const t = setTimeout(() => {
+    debounceTimersByUri.delete(uri);
+    const doc = documents.get(uri);
+    if (!doc) return;
+    void validateDocument(doc);
+  }, delayMs);
+
+  debounceTimersByUri.set(uri, t);
+}
+
+const debounceTimersByUri = new Map<string, ReturnType<typeof setTimeout>>();
+
+async function validateDocument(doc: TextDocument) {
+  const uri = doc.uri;
+  const version = doc.version;
+
+  const text = doc.getText();
+
+  try {
+    parse(text, {
+      ecmaVersion: 2022,
+      allowAwaitOutsideFunction: true,
+      locations: true,
+    } as any);
+
+    // Only publish if this is still the latest version we saw.
+    if (lastKnownVersionByUri.get(uri) !== version) return;
+
+    connection.sendDiagnostics({ uri, diagnostics: [] });
+  } catch (e: unknown) {
+    if (lastKnownVersionByUri.get(uri) !== version) return;
+
+    const diagnostics = syntaxDiagnosticsFromError(e);
+    if (diagnostics) {
+      connection.sendDiagnostics({ uri, diagnostics });
+    } else {
+      connection.sendDiagnostics({ uri, diagnostics: [] });
+    }
+  }
+}
 
 connection.onNotification("strudel/samples", (payload) => {
   if (!payload || typeof payload !== "object") return;

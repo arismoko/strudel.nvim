@@ -25,7 +25,7 @@ local strudel_synced_bufnr = nil
 local strudel_ready = false
 local custom_css_b64 = nil
 local last_received_cursor = nil -- {row, col}
-local lsp_started = false
+local lsp_client_id = nil
 local doc_json_path = nil
 
 -- Event queue for sequential message processing
@@ -207,13 +207,29 @@ local function notify_lsp_samples(samples)
   end
 end
 
-local function start_lsp(bufnr)
-  if lsp_started or not config.lsp.enabled then
+local function start_or_attach_lsp(bufnr)
+  if not config.lsp.enabled then
     return
   end
 
   if not doc_json_path then
     vim.notify("Strudel: doc.json not ready; LSP disabled", vim.log.levels.WARN)
+    return
+  end
+
+  -- Start once, then attach to any ft=strudel buffer.
+  if lsp_client_id then
+    local client = vim.lsp.get_client_by_id(lsp_client_id)
+    if not client then
+      lsp_client_id = nil
+    end
+  end
+
+  if lsp_client_id then
+    local already = vim.lsp.get_clients({ bufnr = bufnr, name = "strudel" })
+    if #already == 0 then
+      pcall(vim.lsp.buf_attach_client, bufnr, lsp_client_id)
+    end
     return
   end
 
@@ -228,15 +244,15 @@ local function start_lsp(bufnr)
     doc_json_path,
   }
 
-  local ok = pcall(vim.lsp.start, {
+  local client_id = vim.lsp.start({
     name = "strudel",
     cmd = cmd,
     root_dir = plugin_root,
     bufnr = bufnr,
   })
 
-  if ok then
-    lsp_started = true
+  if type(client_id) == "number" then
+    lsp_client_id = client_id
 
     -- If we already received samples before LSP started, replay them.
     notify_lsp_samples(stored_samples)
@@ -311,15 +327,16 @@ local function handle_event(full_data)
       local_samples_pending_import = true
     end
 
-    if strudel_synced_bufnr then
-      start_lsp(strudel_synced_bufnr)
-      send_buffer_content()
-      if config.start_on_launch then
-        vim.defer_fn(function()
-          M.update()
-        end, SUCCESSIVE_CMD_DELAY * 2)
-      end
-    end
+     if strudel_synced_bufnr then
+       start_or_attach_lsp(strudel_synced_bufnr)
+       send_buffer_content()
+       if config.start_on_launch then
+         vim.defer_fn(function()
+           M.update()
+         end, SUCCESSIVE_CMD_DELAY * 2)
+       end
+     end
+
   elseif full_data:match("^" .. MESSAGES.CONTENT) then
     local content_b64 = full_data:sub(#MESSAGES.CONTENT + 1)
     if content_b64 == last_content then
@@ -444,22 +461,24 @@ function M.setup(opts)
   })
 
 
-  -- Provide JavaScript syntax highlighting while keeping ft=strudel.
-  vim.api.nvim_create_autocmd("FileType", {
-    group = STRUDEL_SYNC_AUTOCOMMAND,
-    pattern = "strudel",
-    callback = function(ev)
-      -- Defer so we run after Neovim's default `:syntax on` machinery
-      -- (which otherwise resets `&l:syntax` back to the filetype).
-      vim.defer_fn(function()
-        if not vim.api.nvim_buf_is_valid(ev.buf) then
-          return
-        end
-        vim.b[ev.buf].current_syntax = nil
-        vim.cmd("setlocal syntax=javascript")
-      end, 0)
-    end,
-  })
+   -- Provide JavaScript syntax highlighting while keeping ft=strudel.
+   vim.api.nvim_create_autocmd("FileType", {
+     group = STRUDEL_SYNC_AUTOCOMMAND,
+     pattern = "strudel",
+     callback = function(ev)
+       start_or_attach_lsp(ev.buf)
+       -- Defer so we run after Neovim's default `:syntax on` machinery
+       -- (which otherwise resets `&l:syntax` back to the filetype).
+       vim.defer_fn(function()
+         if not vim.api.nvim_buf_is_valid(ev.buf) then
+           return
+         end
+         vim.b[ev.buf].current_syntax = nil
+         vim.cmd("setlocal syntax=javascript")
+       end, 0)
+     end,
+   })
+
   -- Prevent unrelated LSPs from attaching and reporting bogus diagnostics.
   vim.api.nvim_create_autocmd("LspAttach", {
     group = STRUDEL_SYNC_AUTOCOMMAND,
@@ -616,7 +635,7 @@ function M.launch()
       last_content = nil
       strudel_synced_bufnr = nil
       last_received_cursor = nil
-      lsp_started = false
+      lsp_client_id = nil
       doc_json_path = nil
     end,
   })
