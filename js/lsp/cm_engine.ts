@@ -2,6 +2,7 @@ export type CmCompletionOption = {
   label: string;
   type?: string;
   apply?: string;
+  filterText?: string;
   canonicalName?: string;
   isSynonym?: boolean;
 };
@@ -30,6 +31,49 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function stripHtml(html: string) {
   return html.replace(/<[^>]+>/g, "").trim();
+}
+
+function isInsideString(text: string, cursorOffset: number) {
+  const clamped = Math.min(Math.max(cursorOffset, 0), text.length);
+
+  let inQuote: "'" | '"' | "`" | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < clamped; i++) {
+    const ch = text[i];
+    if (!ch) continue;
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      // In JS strings (including template literals), backslash escapes the next char.
+      escaped = true;
+      continue;
+    }
+
+    if (ch === "'" || ch === '"' || ch === "`") {
+      if (!inQuote) {
+        inQuote = ch;
+        continue;
+      }
+
+      if (inQuote === ch) {
+        inQuote = null;
+        continue;
+      }
+    }
+
+    // Reset at newline for single-quote/double-quote strings.
+    if (ch === "\n" && (inQuote === "'" || inQuote === '"')) {
+      inQuote = null;
+      escaped = false;
+    }
+  }
+
+  return inQuote !== null;
 }
 
 function getDocLabel(doc: Doc) {
@@ -206,6 +250,10 @@ const pitchNames = [
   "Cb",
 ];
 
+const pitchNamesLongestFirst = [...pitchNames].sort(
+  (a, b) => b.length - a.length,
+);
+
 // Upstream currently leaves this empty (tonal import is TODO).
 const scaleCompletions: Array<{ label: string; type: string }> = [];
 
@@ -345,7 +393,7 @@ async function chordHandler(context: CompletionContext): Promise<CmCompletionMay
 
   let rootMatch: string | null = null;
   let symbolFragment = fragment;
-  for (const pitch of pitchNames) {
+  for (const pitch of pitchNamesLongestFirst) {
     if (fragment.toLowerCase().startsWith(pitch.toLowerCase())) {
       rootMatch = pitch;
       symbolFragment = fragment.slice(pitch.length);
@@ -353,20 +401,37 @@ async function chordHandler(context: CompletionContext): Promise<CmCompletionMay
     }
   }
 
-  if (rootMatch) {
-    const chordSymbolCompletions = await chordSymbolCompletionsCached();
-    const filteredSymbols = chordSymbolCompletions.filter((s) =>
-      s.label.toLowerCase().startsWith(symbolFragment.toLowerCase()),
-    );
-    const from = chordContext.to - symbolFragment.length;
-    return { from, options: filteredSymbols };
-  }
+  // Do not offer pitch/root completions for `chord("...")`.
+  // This keeps the menu focused on chord symbols/qualities (e.g. ^7, -7, sus).
+  const chordSymbolCompletions = await chordSymbolCompletionsCached();
 
-  const filteredPitches = pitchNames.filter((p) =>
-    p.toLowerCase().startsWith(fragment.toLowerCase()),
+  // If the user typed a root (C, C#, Bb, ...), only complete the symbol part.
+  // If not, allow completing from the start (useful if they paste/edit).
+  const needle = rootMatch ? symbolFragment : fragment;
+
+  const filteredSymbols = chordSymbolCompletions.filter((s) =>
+    s.label.toLowerCase().startsWith(needle.toLowerCase()),
   );
-  const from = chordContext.to - fragment.length;
-  return { from, options: filteredPitches.map((p) => ({ label: p, type: "pitch" })) };
+
+  const from = rootMatch
+    ? chordContext.to - fragment.length
+    : chordContext.to - needle.length;
+  if (!rootMatch) return { from, options: filteredSymbols };
+
+  const rootPrefix = fragment.slice(0, rootMatch.length);
+  const options = filteredSymbols.map((s) => {
+    const symbol = s.apply !== undefined ? s.apply : s.label;
+    const chordText = symbol === "" ? rootPrefix : rootPrefix + symbol;
+
+    return {
+      ...s,
+      label: rootPrefix + s.label,
+      apply: chordText,
+      filterText: chordText,
+    };
+  });
+
+  return { from, options };
 }
 
 function scaleHandler(context: CompletionContext): CmCompletionMaybe {
@@ -493,15 +558,28 @@ export async function complete(
   const sources = params.sources ?? {};
   const ctx = makeContext(text, cursorOffset, params.explicit);
 
-  // Mirror upstream handler order.
-  const handlers: Array<() => Promise<CmCompletionMaybe>> = [
-    async () => soundHandler(ctx, sources),
-    async () => bankHandler(ctx, sources),
-    async () => chordHandler(ctx),
-    async () => scaleHandler(ctx),
-    async () => modeHandler(ctx),
-    async () => fallbackHandler(ctx, params.docIndex.jsdocCompletions),
-  ];
+  // If the cursor is inside a string (`...`, '...', "..."), only offer
+  // string-context completions (sound/bank/etc). Avoid global function
+  // completions from fallbackHandler, which get noisy inside quotes.
+  const inString = isInsideString(text, cursorOffset);
+
+  const handlers: Array<() => Promise<CmCompletionMaybe>> = inString
+    ? [
+        async () => soundHandler(ctx, sources),
+        async () => bankHandler(ctx, sources),
+        async () => chordHandler(ctx),
+        async () => scaleHandler(ctx),
+        async () => modeHandler(ctx),
+      ]
+    : [
+        // Mirror upstream handler order.
+        async () => soundHandler(ctx, sources),
+        async () => bankHandler(ctx, sources),
+        async () => chordHandler(ctx),
+        async () => scaleHandler(ctx),
+        async () => modeHandler(ctx),
+        async () => fallbackHandler(ctx, params.docIndex.jsdocCompletions),
+      ];
 
   for (const h of handlers) {
     const res = await h();
@@ -513,6 +591,18 @@ export async function complete(
 
 export function buildMarkdownDoc(doc: Doc, displayName?: string | null): string {
   const lines: string[] = [];
+
+  const label = getDocLabel(doc);
+
+  if (displayName && label && displayName !== label) {
+    lines.push(`Alias: \`${displayName}\` → \`${label}\``, "");
+  }
+
+  if (label && typeof doc.kind === "string") {
+    lines.push(`\`${label}\` (${doc.kind})`, "");
+  } else if (label) {
+    lines.push(`\`${label}\``, "");
+  }
 
   if (typeof doc.description === "string") {
     const desc = stripHtml(doc.description);
@@ -526,8 +616,34 @@ export function buildMarkdownDoc(doc: Doc, displayName?: string | null): string 
       if (!isRecord(p)) continue;
       const pname = typeof p.name === "string" ? p.name : "?";
       const pdesc = typeof p.description === "string" ? stripHtml(p.description) : "";
+      const ptype =
+        isRecord(p.type) &&
+        Array.isArray((p.type as any).names) &&
+        typeof (p.type as any).names[0] === "string"
+          ? String((p.type as any).names[0])
+          : "";
+
       let line = `- \`${pname}\``;
-      if (pdesc) line += `: ${pdesc}`;
+      if (ptype) line += `: \`${ptype}\``;
+      if (pdesc) line += ` — ${pdesc}`;
+      lines.push(line);
+    }
+  }
+
+  const returns = (doc as any).returns;
+  if (Array.isArray(returns) && returns.length) {
+    const r0 = returns.find((r: unknown) => isRecord(r)) as Record<string, unknown> | undefined;
+    const rdesc = r0 && typeof r0.description === "string" ? stripHtml(r0.description) : "";
+    const rtype =
+      r0 && isRecord(r0.type) && Array.isArray((r0.type as any).names) && typeof (r0.type as any).names[0] === "string"
+        ? String((r0.type as any).names[0])
+        : "";
+
+    if (rtype || rdesc) {
+      lines.push("", "Returns:");
+      let line = "-";
+      if (rtype) line += ` \`${rtype}\``;
+      if (rdesc) line += ` — ${rdesc}`;
       lines.push(line);
     }
   }
@@ -536,25 +652,31 @@ export function buildMarkdownDoc(doc: Doc, displayName?: string | null): string 
   if (Array.isArray(synonyms) && synonyms.length) {
     const syn = synonyms.filter((s) => typeof s === "string" && s !== "");
     if (syn.length) {
-      // Upstream shows a synonyms list that always includes the canonical label.
-      const canonical = getDocLabel(doc);
-      const merged = canonical ? [canonical, ...syn] : syn;
+      const merged = label ? [label, ...syn] : syn;
       const unique = Array.from(new Set(merged)).filter((s) => s !== displayName);
       lines.push("", `Synonyms: ${unique.map((s) => `\`${s}\``).join(", ")}`);
+    }
+  }
+
+  const comment = typeof (doc as any).comment === "string" ? String((doc as any).comment) : "";
+  const seeMatches = Array.from(comment.matchAll(/^\s*\*\s*@see\s+(.+)$/gm)).map((m) =>
+    (m[1] ?? "").trim(),
+  );
+  if (seeMatches.length) {
+    lines.push("", "See:");
+    for (const s of seeMatches.slice(0, 5)) {
+      if (!s) continue;
+      lines.push(`- ${s}`);
     }
   }
 
   const examples = doc.examples;
   if (Array.isArray(examples) && examples.length) {
     lines.push("", "Examples:");
-    for (const ex of examples.slice(0, 3)) {
+    for (const ex of examples.slice(0, 6)) {
       if (typeof ex !== "string" || !ex) continue;
-      lines.push("```strudel", ex, "```");
+      lines.push("```javascript", ex, "```");
     }
-  }
-
-  if (displayName && displayName !== getDocLabel(doc)) {
-    lines.unshift(`Alias: \`${displayName}\` → \`${getDocLabel(doc)}\``, "");
   }
 
   return lines.join("\n");

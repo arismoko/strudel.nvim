@@ -4,16 +4,20 @@ import fs from "fs";
 import path from "path";
 
 import {
+  CodeAction,
+  CodeActionKind,
   CompletionItemKind,
   createConnection,
   Diagnostic,
   DiagnosticSeverity,
   MarkupKind,
   ProposedFeatures,
+  Range,
   TextDocumentPositionParams,
   TextDocuments,
   TextDocumentSyncKind,
   TextEdit,
+  WorkspaceEdit,
 } from "vscode-languageserver/node.js";
 
 import { TextDocument } from "vscode-languageserver-textdocument";
@@ -66,6 +70,121 @@ function positionToOffset(
 
 function stripHtml(html: string) {
   return html.replace(/<[^>]+>/g, "").trim();
+}
+
+function rangeToOffsets(text: string, range: Range) {
+  const start = positionToOffset(text, range.start);
+  const end = positionToOffset(text, range.end);
+  return { start: Math.min(start, end), end: Math.max(start, end) };
+}
+
+type QuoteChar = "'" | '"' | "`";
+
+function isEscaped(text: string, i: number) {
+  let backslashes = 0;
+  for (let j = i - 1; j >= 0 && text[j] === "\\"; j--) backslashes++;
+  return backslashes % 2 === 1;
+}
+
+function findEnclosingStringLiteral(
+  text: string,
+  selectionStart: number,
+  selectionEnd: number,
+): { start: number; end: number; quote: QuoteChar; innerStart: number; innerEnd: number } | null {
+  // Only support single-line literals for now.
+  const before = text.lastIndexOf("\n", selectionStart - 1);
+  const lineStart = before === -1 ? 0 : before + 1;
+  const after = text.indexOf("\n", selectionEnd);
+  const lineEnd = after === -1 ? text.length : after;
+
+  // Scan left for an opening quote.
+  let open = -1;
+  let quote: QuoteChar | null = null;
+  for (let i = selectionStart - 1; i >= lineStart; i--) {
+    const ch = text[i];
+    if ((ch === "'" || ch === '"' || ch === "`") && !isEscaped(text, i)) {
+      open = i;
+      quote = ch as QuoteChar;
+      break;
+    }
+  }
+  if (open === -1 || !quote) return null;
+
+  // Scan right for the matching closing quote.
+  let close = -1;
+  for (let i = Math.max(selectionEnd, open + 1); i < lineEnd; i++) {
+    const ch = text[i];
+    if (ch === quote && !isEscaped(text, i)) {
+      close = i;
+      break;
+    }
+  }
+  if (close === -1) return null;
+
+  const innerStart = open + 1;
+  const innerEnd = close;
+
+  // Selection must be fully inside the literal (or exactly cover it).
+  if (selectionStart < open || selectionEnd > close + 1) return null;
+
+  return { start: open, end: close + 1, quote, innerStart, innerEnd };
+}
+
+function rewriteLiteralContent(content: string, from: QuoteChar, to: QuoteChar) {
+  let out = content;
+
+  // Normalize common escaped quotes when changing away from that delimiter.
+  if (from === "'" && to !== "'") {
+    out = out.replace(/\\'/g, "'");
+  }
+  if (from === '"' && to !== '"') {
+    out = out.replace(/\\\"/g, '"');
+  }
+  if (from === "`" && to !== "`") {
+    out = out.replace(/\\`/g, "`");
+  }
+
+  if (to === '"') {
+    out = out.replace(/\\/g, "\\\\");
+    out = out.replace(/\"/g, "\\\"");
+    // Disallow multiline -> quoted strings.
+    if (out.includes("\n")) return null;
+    return out;
+  }
+
+  if (to === "`") {
+    // Template literals: avoid accidental interpolation.
+    out = out.replace(/\\/g, "\\\\");
+    out = out.replace(/`/g, "\\`");
+    out = out.replace(/\$\{/g, "\\${");
+    return out;
+  }
+
+  // to === "'"
+  out = out.replace(/\\/g, "\\\\");
+  out = out.replace(/'/g, "\\'");
+  if (out.includes("\n")) return null;
+  return out;
+}
+
+function makeConvertQuoteAction(
+  title: string,
+  kind: CodeActionKind,
+  uri: string,
+  literalRange: Range,
+  newText: string,
+): CodeAction {
+  const edit: WorkspaceEdit = {
+    changes: {
+      [uri]: [TextEdit.replace(literalRange, newText)],
+    },
+  };
+
+  return {
+    title,
+    kind,
+    edit,
+  };
 }
 
 type SampleIndex = { soundNames: string[]; banks: string[] };
@@ -165,6 +284,15 @@ connection.onInitialize(() => {
         triggerCharacters: ["(", "\"", "'", ":"],
       },
       hoverProvider: true,
+      codeActionProvider: {
+        codeActionKinds: [
+          CodeActionKind.RefactorExtract,
+          CodeActionKind.RefactorRewrite,
+        ],
+      },
+      executeCommandProvider: {
+        commands: ["strudel.extractLet"],
+      },
     },
   };
 });
@@ -271,6 +399,7 @@ function cmTypeToLspKind(type?: string): CompletionItemKind {
     case "pitch":
     case "mode":
     case "scale":
+      return CompletionItemKind.Value;
     case "chord-symbol":
       return CompletionItemKind.Value;
     default:
@@ -286,6 +415,89 @@ function offsetToPosition(text: string, offset: number) {
   const character = parts[parts.length - 1].length;
   return { line, character };
 }
+
+connection.onCodeAction((params) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const text = doc.getText();
+  const { start: selStart, end: selEnd } = rangeToOffsets(text, params.range);
+  const uri = params.textDocument.uri;
+
+  const actions: CodeAction[] = [];
+
+  // Extract selection -> let declaration (selection required).
+  if (selStart !== selEnd) {
+    actions.push({
+      title: "Extract to let…",
+      kind: CodeActionKind.RefactorExtract,
+      command: {
+        title: "Extract to let…",
+        command: "strudel.extractLet",
+        arguments: [
+          {
+            uri,
+            range: params.range,
+          },
+        ],
+      },
+    });
+  }
+
+  // Many clients (including Neovim) call code actions with an empty range.
+  // For quote rewrites, operate on the cursor position by treating it as a
+  // 1-character selection.
+  const effectiveEnd = selStart === selEnd ? Math.min(selEnd + 1, text.length) : selEnd;
+
+  const lit = findEnclosingStringLiteral(text, selStart, effectiveEnd);
+  if (!lit) return actions;
+
+  const content = text.slice(lit.innerStart, lit.innerEnd);
+  const k = CodeActionKind.RefactorRewrite;
+
+  // Convert to `...`
+  if (lit.quote !== "`") {
+    const rewritten = rewriteLiteralContent(content, lit.quote, "`");
+    if (rewritten !== null) {
+      const newLiteral = "`" + rewritten + "`";
+      actions.push(
+        makeConvertQuoteAction(
+          "Convert to template string",
+          k,
+          uri,
+          {
+            start: offsetToPosition(text, lit.start),
+            end: offsetToPosition(text, lit.end),
+          },
+          newLiteral,
+        ),
+      );
+    }
+  }
+
+  // Convert to "..."
+  if (lit.quote !== '"') {
+    const rewritten = rewriteLiteralContent(content, lit.quote, '"');
+    if (rewritten !== null) {
+      const newLiteral = '"' + rewritten + '"';
+      actions.push(
+        makeConvertQuoteAction(
+          "Convert to double quotes",
+          k,
+          uri,
+          {
+            start: offsetToPosition(text, lit.start),
+            end: offsetToPosition(text, lit.end),
+          },
+          newLiteral,
+        ),
+      );
+    }
+  }
+
+  return actions;
+});
+
 
 connection.onCompletion(async (params) => {
   const doc = documents.get(params.textDocument.uri);
@@ -309,6 +521,7 @@ connection.onCompletion(async (params) => {
 
   if (!cm) return [];
 
+
   return cm.options.map((opt) => {
     const newText = opt.apply !== undefined ? opt.apply : opt.label;
     const range = {
@@ -321,6 +534,7 @@ connection.onCompletion(async (params) => {
       kind: cmTypeToLspKind(opt.type),
       // Upstream CodeMirror does not force ordering between synonyms and canonicals.
       sortText: undefined,
+      filterText: opt.filterText,
       textEdit: TextEdit.replace(range, newText),
       data:
         opt.type === "function" && opt.canonicalName
@@ -345,7 +559,6 @@ connection.onCompletionResolve((item) => {
   const displayName = data.type === "syn" ? (data.synonym as string) : null;
   const md = buildMarkdownDoc(doc, displayName);
 
-  item.detail = typeof (doc as any).description === "string" ? stripHtml((doc as any).description) : undefined;
   item.documentation = { kind: MarkupKind.Markdown, value: md };
   return item;
 });
@@ -368,7 +581,9 @@ connection.onHover((params) => {
   let canonical = word;
   let displayName: string | null = null;
 
-  if (!docIndex.byName.has(canonical) && docIndex.bySynonym.has(canonical)) {
+  // Hover differs from completion: users may hover a control synonym
+  // (`cutoff`) and expect to see docs for the canonical function (`lpf`).
+  if (docIndex.bySynonym.has(canonical)) {
     displayName = canonical;
     canonical = docIndex.bySynonym.get(canonical) as string;
   }

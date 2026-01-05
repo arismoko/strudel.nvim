@@ -2,6 +2,8 @@ local base64 = require("strudel.base64")
 
 local M = {}
 
+local log = require("strudel.log")
+
 local MESSAGES = {
   CONTENT = "STRUDEL_CONTENT:",
   QUIT = "STRUDEL_QUIT",
@@ -26,7 +28,15 @@ local strudel_ready = false
 local custom_css_b64 = nil
 local last_received_cursor = nil -- {row, col}
 local lsp_client_id = nil
-local doc_json_path = nil
+local doc_json_path = vim.fn.stdpath("cache") .. "/strudel-nvim/doc.json"
+local docgen_job_id = nil
+local docgen_running = false
+local docgen_failed = nil
+local docgen_failed_at = nil
+local docgen_retry_timer = nil
+local pending_lsp_bufs = {}
+
+local cancel_active_job
 
 -- Event queue for sequential message processing
 local event_queue = {}
@@ -55,7 +65,6 @@ local config = {
   browser_exec_path = nil,
   browser_remote_debug_port = 9222,
   local_server = {
-    enabled = true,
     repo_url = "https://codeberg.org/uzu/strudel.git",
     repo_dir = vim.fn.stdpath("cache") .. "/strudel-nvim/strudel-src"
   },
@@ -125,13 +134,13 @@ local function start_local_samples_server(plugin_root)
         local b64 = line:sub(#"STRUDEL_LOCAL_SAMPLES_READY:" + 1)
         local ok, decoded = pcall(base64.decode, b64)
         if not ok then
-          vim.notify("Strudel local samples: failed to decode READY", vim.log.levels.WARN)
+          log.warn("Strudel local samples: failed to decode READY")
           return
         end
 
         local ok2, payload = pcall(vim.json.decode, decoded)
         if not ok2 or type(payload) ~= "table" then
-          vim.notify("Strudel local samples: invalid READY payload", vim.log.levels.WARN)
+          log.warn("Strudel local samples: invalid READY payload")
           return
         end
 
@@ -149,9 +158,9 @@ local function start_local_samples_server(plugin_root)
         local b64 = line:sub(#"STRUDEL_LOCAL_SAMPLES_ERROR:" + 1)
         local ok, decoded = pcall(base64.decode, b64)
         if ok then
-          vim.notify("Strudel local samples error: " .. decoded, vim.log.levels.WARN)
+          log.warn("Strudel local samples error: " .. decoded)
         else
-          vim.notify("Strudel local samples error", vim.log.levels.WARN)
+          log.warn("Strudel local samples error")
         end
       end
     end
@@ -167,7 +176,7 @@ local function send_message(message)
   if strudel_job_id then
     vim.fn.chansend(strudel_job_id, message .. "\n")
   else
-    vim.notify("No active Strudel session", vim.log.levels.WARN)
+    log.warn("No active Strudel session")
   end
 end
 local function set_samples(samples)
@@ -176,7 +185,7 @@ end
 
 function M.import_local_samples()
   if not strudel_job_id then
-    vim.notify("No active Strudel session", vim.log.levels.WARN)
+    log.warn("No active Strudel session")
     return
   end
 
@@ -189,9 +198,9 @@ function M.import_local_samples()
 
   if local_samples_job_id then
     local_samples_pending_import = true
-    vim.notify("Strudel local samples: waiting for server...", vim.log.levels.INFO)
+    log.info("Strudel local samples: waiting for server...")
   else
-    vim.notify("Strudel local samples: no samples folder detected", vim.log.levels.INFO)
+    log.info("Strudel local samples: no samples folder detected")
   end
 end
 
@@ -207,13 +216,235 @@ local function notify_lsp_samples(samples)
   end
 end
 
-local function start_or_attach_lsp(bufnr)
+local start_or_attach_lsp
+
+local function doc_json_file_ready()
+  if not doc_json_path or doc_json_path == "" then
+    return false
+  end
+
+  local stat = (vim.uv or vim.loop).fs_stat(doc_json_path)
+  return stat and stat.type == "file" and stat.size and stat.size > 0
+end
+
+local function doc_json_valid()
+  if not doc_json_file_ready() then
+    return false
+  end
+
+  local ok, lines = pcall(vim.fn.readfile, doc_json_path)
+  if not ok or type(lines) ~= "table" then
+    return false
+  end
+
+  local raw = table.concat(lines, "\n")
+  local ok2, decoded = pcall(vim.json.decode, raw)
+  if not ok2 or type(decoded) ~= "table" then
+    return false
+  end
+
+  return type(decoded.docs) == "table"
+end
+
+local function attach_pending_lsp_bufs()
+  if not doc_json_valid() then
+    return
+  end
+
+  for bufnr, _ in pairs(pending_lsp_bufs) do
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      start_or_attach_lsp(bufnr)
+    end
+    pending_lsp_bufs[bufnr] = nil
+  end
+end
+
+local function start_docgen(plugin_root)
+  if docgen_running then
+    return
+  end
+
+  -- Auto-retry is allowed, but avoid as-fast-as-possible respawn loops.
+  if docgen_failed_at and (os.time() - docgen_failed_at) < 30 then
+    if not docgen_retry_timer then
+      vim.schedule(function()
+        log.info("doc.json generation recently failed; retrying soon")
+      end)
+      docgen_retry_timer = vim.defer_fn(function()
+        docgen_retry_timer = nil
+        if doc_json_valid() then
+          attach_pending_lsp_bufs()
+          return
+        end
+        start_docgen(plugin_root)
+      end, 30 * 1000)
+    end
+    return
+  end
+
+  docgen_running = true
+  docgen_failed = nil
+  docgen_failed_at = nil
+
+  if docgen_retry_timer then
+    pcall(function()
+      docgen_retry_timer:stop()
+      docgen_retry_timer:close()
+    end)
+    docgen_retry_timer = nil
+  end
+
+  local script = plugin_root .. "/js/launch.js"
+
+  if not doc_json_path or doc_json_path == "" then
+    doc_json_path = vim.fn.stdpath("cache") .. "/strudel-nvim/doc.json"
+  end
+
+  local args = {
+    "node",
+    script,
+    "--doc-json-out=" .. doc_json_path,
+    "--doc-only",
+  }
+
+  table.insert(args, "--local-server")
+  table.insert(args, "--repo-url=" .. config.local_server.repo_url)
+  table.insert(args, "--repo-dir=" .. config.local_server.repo_dir)
+
+  vim.schedule(function()
+    log.reset_run({ title = "Strudel: generate docs", status = "running", focus = true })
+    log.output({ "starting...", "" })
+  end)
+
+  local collected_err = {}
+
+  local function collect_lines(data)
+    if not data then
+      return
+    end
+
+    local printable = {}
+    for _, line in ipairs(data) do
+      if type(line) == "string" and line ~= "" then
+        table.insert(printable, line)
+        table.insert(collected_err, line)
+        if #collected_err > 40 then
+          table.remove(collected_err, 1)
+        end
+      end
+    end
+
+    if #printable > 0 then
+      vim.schedule(function()
+        log.output(printable)
+      end)
+    end
+  end
+
+  docgen_job_id = vim.fn.jobstart(args, {
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, data)
+      collect_lines(data)
+    end,
+    on_stderr = function(_, data)
+      collect_lines(data)
+    end,
+    on_exit = function(_, code)
+      docgen_job_id = nil
+      docgen_running = false
+
+      vim.schedule(function()
+        log.attach_job(nil)
+      end)
+
+      if code == 0 then
+        local attempts_left = 10
+        local function try_attach()
+          if doc_json_file_ready() then
+            vim.schedule(function()
+               log.output({ "", "doc.json ready; starting LSP" })
+               log.attach_job(nil)
+            end)
+            attach_pending_lsp_bufs()
+            return
+          end
+
+          attempts_left = attempts_left - 1
+          if attempts_left <= 0 then
+            docgen_failed = "doc.json generation failed"
+            docgen_failed_at = os.time()
+            local tail = table.concat(collected_err, "\n")
+            vim.schedule(function()
+              log.output({ "", "doc.json generation finished but file not ready", "" })
+              if tail ~= "" then
+                log.output({ "--- tail ---", tail })
+              end
+              log.error("doc.json generation finished but file not ready", { notify = true })
+            end)
+            return
+          end
+
+          vim.defer_fn(try_attach, 100)
+        end
+
+        try_attach()
+        return
+      end
+
+      docgen_failed = "doc.json generation failed"
+      docgen_failed_at = os.time()
+      local tail = table.concat(collected_err, "\n")
+      vim.schedule(function()
+        log.output({ "", "doc.json generation failed", "" })
+        if tail ~= "" then
+          log.output({ "--- tail ---", tail })
+        end
+        log.error("doc.json generation failed", { notify = true })
+      end)
+    end,
+  })
+
+  vim.schedule(function()
+    log.attach_job(docgen_job_id)
+  end)
+
+  if type(docgen_job_id) ~= "number" or docgen_job_id <= 0 then
+    docgen_job_id = nil
+    docgen_running = false
+    docgen_failed = "jobstart failed"
+    docgen_failed_at = os.time()
+    vim.schedule(function()
+      log.error("failed to start doc generation job", { notify = true })
+    end)
+  end
+end
+
+local function ensure_doc_json_then_start_lsp(bufnr)
+  pending_lsp_bufs[bufnr] = true
+
+  if doc_json_valid() then
+    log.info("doc.json found; starting LSP")
+    attach_pending_lsp_bufs()
+    return
+  end
+
+  if docgen_failed then
+    -- Auto-retry on subsequent opens per user preference.
+    -- Backoff is handled in start_docgen().
+    docgen_failed = nil
+  end
+
+  local plugin_root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h")
+  start_docgen(plugin_root)
+end
+
+start_or_attach_lsp = function(bufnr)
   if not config.lsp.enabled then
     return
   end
 
-  if not doc_json_path then
-    vim.notify("Strudel: doc.json not ready; LSP disabled", vim.log.levels.WARN)
+  if not doc_json_valid() then
     return
   end
 
@@ -229,6 +460,7 @@ local function start_or_attach_lsp(bufnr)
     local already = vim.lsp.get_clients({ bufnr = bufnr, name = "strudel" })
     if #already == 0 then
       pcall(vim.lsp.buf_attach_client, bufnr, lsp_client_id)
+      log.info("LSP attached")
     end
     return
   end
@@ -244,20 +476,171 @@ local function start_or_attach_lsp(bufnr)
     doc_json_path,
   }
 
-  local client_id = vim.lsp.start({
-    name = "strudel",
-    cmd = cmd,
+  log.info("LSP starting...")
+   local ok, client_id_or_err = pcall(vim.lsp.start, {
+     name = "strudel",
+     cmd = cmd,
     root_dir = plugin_root,
-    bufnr = bufnr,
+     bufnr = bufnr,
+     handlers = {
+       ["textDocument/completion"] = function(err, result, ctx, config_)
+         local n = 0
+         if type(result) == "table" then
+           if type(result.items) == "table" then
+             n = #result.items
+           elseif vim.tbl_islist(result) then
+             n = #result
+           end
+         end
+         log.output(string.format("[lsp] completion response: err=%s items=%d", tostring(err ~= nil), n))
+         return vim.lsp.handlers["textDocument/completion"](err, result, ctx, config_)
+       end,
+     },
+     on_attach = function(client, attached_bufnr)
+       if client.rpc and client.rpc.stderr and type(client.rpc.stderr.read_start) == "function" then
+         client.rpc.stderr:read_start(function(err, chunk)
+           if err then
+             log.warn("LSP stderr read error: " .. tostring(err), { notify = false })
+             return
+           end
+           if not chunk or chunk == "" then
+             return
+           end
+           for _, line in ipairs(vim.split(chunk, "\n", { plain = true, trimempty = true })) do
+             log.output("[lsp] " .. line)
+           end
+         end)
+       end
+
+       -- LSP-side code actions can invoke custom commands; handle them here.
+       client.commands = client.commands or {}
+       client.commands["strudel.extractLet"] = function(command, ctx)
+        local args = (command and command.arguments and command.arguments[1]) or {}
+        local uri = args.uri
+        local range = args.range
+        local target_bufnr = attached_bufnr
+
+        if type(uri) == "string" and uri ~= "" then
+          local maybe = vim.uri_to_bufnr(uri)
+          if type(maybe) == "number" and maybe > 0 then
+            target_bufnr = maybe
+          end
+        end
+
+        if not (range and range.start and range["end"]) then
+          log.warn("extractLet: missing range")
+          return
+        end
+
+        local start = range.start
+        local finish = range["end"]
+        local srow = (start.line or 0)
+        local scol = (start.character or 0)
+        local erow = (finish.line or 0)
+        local ecol = (finish.character or 0)
+
+        if srow > erow or (srow == erow and scol > ecol) then
+          -- Normalize reversed ranges.
+          srow, erow = erow, srow
+          scol, ecol = ecol, scol
+        end
+
+        local lines = vim.api.nvim_buf_get_lines(target_bufnr, srow, erow + 1, false)
+        if #lines == 0 then
+          return
+        end
+
+        local selected = ""
+        if srow == erow then
+          local line = lines[1] or ""
+          selected = line:sub(scol + 1, ecol)
+        else
+          local first = lines[1] or ""
+          local last = lines[#lines] or ""
+
+          local parts = {}
+          parts[1] = first:sub(scol + 1)
+          for i = 2, #lines - 1 do
+            parts[#parts + 1] = lines[i] or ""
+          end
+          parts[#parts + 1] = last:sub(1, ecol)
+
+          selected = table.concat(parts, "\n")
+        end
+
+        if selected == "" then
+          return
+        end
+
+        vim.ui.input({ prompt = "Extract to let: name" }, function(name)
+          if not name or name == "" then
+            return
+          end
+
+          if not name:match("^[%a_$][%w_$]*$") then
+            log.warn("invalid variable name: " .. tostring(name))
+            return
+          end
+
+          local first_line = vim.api.nvim_buf_get_lines(target_bufnr, srow, srow + 1, false)[1] or ""
+          local indent = first_line:match("^%s*") or ""
+
+          local decl_lines = {}
+          if selected:find("\n") then
+            decl_lines[1] = "let " .. name .. " = ("
+            for _, l in ipairs(vim.split(selected, "\n", { plain = true })) do
+              decl_lines[#decl_lines + 1] = indent .. l
+            end
+            decl_lines[#decl_lines + 1] = ")"
+          else
+            decl_lines[1] = "let " .. name .. " = " .. selected
+          end
+
+          -- Replace selection with variable name, then insert declaration at top.
+          if srow == erow then
+            local repl_line = vim.api.nvim_buf_get_lines(target_bufnr, srow, srow + 1, false)[1] or ""
+            local before = repl_line:sub(1, scol)
+            local after = repl_line:sub(ecol + 1)
+            local new_line = before .. name .. after
+            vim.api.nvim_buf_set_lines(target_bufnr, srow, srow + 1, false, { new_line })
+          else
+            local first = lines[1] or ""
+            local last = lines[#lines] or ""
+            local before = first:sub(1, scol)
+            local after = last:sub(ecol + 1)
+            local new_line = before .. name .. after
+            vim.api.nvim_buf_set_lines(target_bufnr, srow, erow + 1, false, { new_line })
+          end
+
+          vim.api.nvim_buf_set_lines(target_bufnr, 0, 0, false, vim.list_extend(decl_lines, { "" }))
+        end)
+      end
+    end,
   })
 
-  if type(client_id) == "number" then
-    lsp_client_id = client_id
-
-    -- If we already received samples before LSP started, replay them.
-    notify_lsp_samples(stored_samples)
+  if not ok then
+      vim.schedule(function()
+        log.reset_run({ title = "Strudel: LSP", status = "failed", focus = true })
+        log.error("failed to start LSP: " .. tostring(client_id_or_err), { notify = true })
+      end)
+    return
   end
+
+  if type(client_id_or_err) ~= "number" then
+    vim.schedule(function()
+      log.reset_run({ title = "Strudel: LSP", status = "failed", focus = true })
+      log.error("failed to start LSP (no client id returned)", { notify = true })
+    end)
+    return
+  end
+
+  lsp_client_id = client_id_or_err
+  log.info("LSP started (client id=" .. tostring(lsp_client_id) .. ")")
+
+  -- If we already received samples before LSP started, replay them.
+  notify_lsp_samples(stored_samples)
 end
+
 local function send_cursor_position()
   if not strudel_job_id or not strudel_synced_bufnr or not strudel_ready or not config.sync_cursor then
     return
@@ -327,9 +710,10 @@ local function handle_event(full_data)
       local_samples_pending_import = true
     end
 
-     if strudel_synced_bufnr then
-       start_or_attach_lsp(strudel_synced_bufnr)
-       send_buffer_content()
+      if strudel_synced_bufnr then
+        ensure_doc_json_then_start_lsp(strudel_synced_bufnr)
+        send_buffer_content()
+
        if config.start_on_launch then
          vim.defer_fn(function()
            M.update()
@@ -374,30 +758,31 @@ local function handle_event(full_data)
     local decoded = base64.decode(b64)
     local ok, payload = pcall(vim.json.decode, decoded)
 
-    vim.schedule(function()
-      if ok and type(payload) == "table" and type(payload.importedKeys) == "table" then
-        vim.notify(
-          string.format(
-            "Strudel local samples: imported %d sounds (soundMap now %s)",
-            #payload.importedKeys,
-            tostring(payload.soundCountAfter or "?")),
-          vim.log.levels.INFO)
-      else
-        vim.notify("Strudel local samples: imported", vim.log.levels.INFO)
-      end
-    end)
+     vim.schedule(function()
+       if ok and type(payload) == "table" and type(payload.importedKeys) == "table" then
+         log.info(
+           string.format(
+             "Strudel local samples: imported %d sounds (soundMap now %s)",
+             #payload.importedKeys,
+             tostring(payload.soundCountAfter or "?"))
+         )
+       else
+         log.info("Strudel local samples: imported")
+       end
+     end)
+
   elseif full_data:match("^STRUDEL_IMPORT_LOCAL_SAMPLES_ERROR:") then
     local b64 = full_data:sub(#"STRUDEL_IMPORT_LOCAL_SAMPLES_ERROR:" + 1)
     local decoded = base64.decode(b64)
     vim.schedule(function()
-      vim.notify("Strudel local samples import failed: " .. decoded, vim.log.levels.WARN)
+      log.warn("Strudel local samples import failed: " .. decoded)
     end)
   elseif full_data:match("^" .. MESSAGES.EVAL_ERROR) then
     local error_b64 = full_data:sub(#MESSAGES.EVAL_ERROR + 1)
     local error = base64.decode(error_b64)
     if config.report_eval_errors then
       vim.schedule(function()
-        vim.notify("Strudel Error: " .. error, vim.log.levels.ERROR)
+        log.error("Strudel Error: " .. error)
       end)
     end
   end
@@ -434,9 +819,11 @@ function M.setup(opts)
       f:close()
       custom_css_b64 = base64.encode(css)
     else
-      vim.notify("Could not read custom CSS file: " .. css_path, vim.log.levels.ERROR)
+      log.error("Could not read custom CSS file: " .. css_path)
     end
   end
+
+  -- Doc path is stable and decoupled from session launch.
 
   -- Create autocmd group
   vim.api.nvim_create_augroup(STRUDEL_SYNC_AUTOCOMMAND, { clear = true })
@@ -454,7 +841,7 @@ function M.setup(opts)
 
       if strudel_job_id == nil then
         vim.schedule(function()
-          vim.notify("Strudel session not running. Use :StrudelLaunch", vim.log.levels.INFO)
+          log.hint_once("no_session", "Strudel session not running. Use :StrudelLaunch")
         end)
       end
     end,
@@ -465,19 +852,26 @@ function M.setup(opts)
    vim.api.nvim_create_autocmd("FileType", {
      group = STRUDEL_SYNC_AUTOCOMMAND,
      pattern = "strudel",
-     callback = function(ev)
-       start_or_attach_lsp(ev.buf)
-       -- Defer so we run after Neovim's default `:syntax on` machinery
-       -- (which otherwise resets `&l:syntax` back to the filetype).
-       vim.defer_fn(function()
-         if not vim.api.nvim_buf_is_valid(ev.buf) then
-           return
-         end
-         vim.b[ev.buf].current_syntax = nil
-         vim.cmd("setlocal syntax=javascript")
-       end, 0)
-     end,
-   })
+       callback = function(ev)
+        ensure_doc_json_then_start_lsp(ev.buf)
+
+        -- Enable comment plugins (gc) by providing a JS-style commentstring.
+        -- Keep ft=strudel so other JS/TS LSPs don't auto-attach.
+        vim.bo[ev.buf].commentstring = "// %s"
+
+
+        -- Defer so we run after Neovim's default `:syntax on` machinery
+        -- (which otherwise resets `&l:syntax` back to the filetype).
+        vim.defer_fn(function()
+          if not vim.api.nvim_buf_is_valid(ev.buf) then
+            return
+          end
+          vim.b[ev.buf].current_syntax = nil
+          vim.cmd("setlocal syntax=javascript")
+        end, 0)
+      end,
+    })
+
 
   -- Prevent unrelated LSPs from attaching and reporting bogus diagnostics.
   vim.api.nvim_create_autocmd("LspAttach", {
@@ -515,11 +909,41 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("StrudelSetBuffer", M.set_buffer, { nargs = "?" })
   vim.api.nvim_create_user_command("StrudelExecute", M.execute, {})
   vim.api.nvim_create_user_command("StrudelImportLocalSamples", M.import_local_samples, {})
+
+
+  vim.api.nvim_create_user_command("StrudelGenerateDocs", function()
+    local plugin_root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h")
+    start_docgen(plugin_root)
+  end, { desc = "Generate doc.json used by Strudel LSP" })
+
+  vim.api.nvim_create_user_command("StrudelLogs", function()
+    log.open(true)
+  end, { desc = "Open Strudel log window" })
+
+  vim.api.nvim_create_user_command("StrudelCancel", function()
+    cancel_active_job()
+  end, { desc = "Cancel running Strudel job" })
+end
+
+cancel_active_job = function()
+  if docgen_job_id and docgen_job_id > 0 then
+    log.reset_run({ title = "Strudel: generate docs", status = "running", focus = true })
+    log.attach_job(docgen_job_id)
+    log.cancel()
+    return
+  end
+
+  if strudel_job_id and strudel_job_id > 0 then
+    log.reset_run({ title = "Strudel: launch", status = "running", focus = true })
+    log.attach_job(strudel_job_id)
+    log.cancel()
+  end
 end
 
 function M.launch()
   if strudel_job_id ~= nil then
-    vim.notify("Strudel is already running, run :StrudelQuit to quit.", vim.log.levels.ERROR)
+    log.open(true)
+    log.warn("Strudel is already running, run :StrudelQuit to quit.")
     return
   end
 
@@ -529,14 +953,11 @@ function M.launch()
   local launch_script = plugin_root .. "/js/launch.js"
   local cmd = "node " .. vim.fn.shellescape(launch_script)
 
-  doc_json_path = vim.fn.stdpath("cache") .. "/strudel-nvim/doc.json"
   cmd = cmd .. " --doc-json-out=" .. vim.fn.shellescape(doc_json_path)
 
-  if config.local_server.enabled then
-    cmd = cmd .. " --local-server"
-    cmd = cmd .. " --repo-url=" .. vim.fn.shellescape(config.local_server.repo_url)
-    cmd = cmd .. " --repo-dir=" .. vim.fn.shellescape(config.local_server.repo_dir)
-  end
+  cmd = cmd .. " --local-server"
+  cmd = cmd .. " --repo-url=" .. vim.fn.shellescape(config.local_server.repo_url)
+  cmd = cmd .. " --repo-dir=" .. vim.fn.shellescape(config.local_server.repo_dir)
 
   if config.ui.hide_top_bar then
     cmd = cmd .. " --hide-top-bar"
@@ -585,26 +1006,32 @@ function M.launch()
       or line:match("^>%s")
   end
 
-  local function is_real_error_line(line)
-    -- Heuristic: only escalate obvious failures.
-    return line:lower():match("error")
-      or line:lower():match("failed")
-      or line:lower():match("exception")
-      or line:lower():match("traceback")
-  end
+
+  vim.schedule(function()
+    log.reset_run({ title = "Strudel: launch", status = "running", focus = true })
+    log.output({ "starting...", "" })
+  end)
 
   -- Run the js script
   strudel_job_id = vim.fn.jobstart(cmd, {
+    stdout_buffered = false,
+    stderr_buffered = false,
     on_stderr = function(_, data)
       if not data then
         return
       end
 
+      local printable = {}
       for _, line in ipairs(data) do
-        if line ~= "" and not is_noise_line(line) then
-          local level = is_real_error_line(line) and vim.log.levels.ERROR or vim.log.levels.INFO
-          vim.notify("Strudel: " .. line, level)
+        if type(line) == "string" and line ~= "" and not is_noise_line(line) then
+          table.insert(printable, line)
         end
+      end
+
+      if #printable > 0 then
+        vim.schedule(function()
+          log.output(printable)
+        end)
       end
     end,
     on_stdout = function(_, data)
@@ -612,31 +1039,72 @@ function M.launch()
         return
       end
 
+      local non_proto = {}
       for _, line in ipairs(data) do
         if line ~= "" then
           table.insert(event_queue, line)
+          if not line:match("^STRUDEL_") then
+            table.insert(non_proto, line)
+          end
         end
+      end
+
+      if #non_proto > 0 then
+        vim.schedule(function()
+          log.output(non_proto)
+        end)
       end
 
       process_event_queue()
     end,
     on_exit = function(_, code)
-      if code == 0 then
-        vim.notify("Strudel session closed", vim.log.levels.INFO)
-      else
-        vim.notify("Strudel process error: " .. code, vim.log.levels.ERROR)
-      end
+      vim.schedule(function()
+        log.attach_job(nil)
+        if code == 0 then
+          log.output({ "", "session closed" })
+          log.attach_job(nil)
+        else
+          log.output({ "", "process exited with code " .. tostring(code) })
+          log.error("Strudel process exited with code " .. tostring(code), { notify = true })
+        end
+      end)
 
       stop_local_samples_server()
 
       -- reset state
       strudel_ready = false
+      local stopped_strudel_id = strudel_job_id
       strudel_job_id = nil
+      vim.schedule(function()
+        if log.get_job_id() == stopped_strudel_id then
+          log.attach_job(nil)
+        end
+      end)
       last_content = nil
       strudel_synced_bufnr = nil
       last_received_cursor = nil
       lsp_client_id = nil
-      doc_json_path = nil
+      local stopped_docgen_id = docgen_job_id
+      if stopped_docgen_id then
+        pcall(vim.fn.jobstop, stopped_docgen_id)
+      end
+      docgen_job_id = nil
+      vim.schedule(function()
+        if log.get_job_id() == stopped_docgen_id then
+          log.attach_job(nil)
+        end
+      end)
+      docgen_running = false
+      docgen_failed = nil
+      docgen_failed_at = nil
+      if docgen_retry_timer then
+        pcall(function()
+          docgen_retry_timer:stop()
+          docgen_retry_timer:close()
+        end)
+      end
+      docgen_retry_timer = nil
+      pending_lsp_bufs = {}
     end,
   })
 
@@ -672,13 +1140,13 @@ function M.set_buffer(opts)
   end
 
   if not strudel_job_id then
-    vim.notify("No active Strudel session", vim.log.levels.WARN)
+    log.warn("No active Strudel session")
     return false
   end
 
   local bufnr = opts and opts.args and opts.args ~= "" and tonumber(opts.args) or vim.api.nvim_get_current_buf()
   if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
-    vim.notify("Invalid buffer number for :StrudelSetBuffer", vim.log.levels.ERROR)
+    log.error("Invalid buffer number for :StrudelSetBuffer")
     return false
   end
 
@@ -728,7 +1196,7 @@ function M.set_buffer(opts)
   if buffer_name == "" then
     buffer_name = "#" .. bufnr
   end
-  vim.notify("Strudel is now syncing buffer " .. buffer_name, vim.log.levels.INFO)
+  log.info("Strudel is now syncing buffer " .. buffer_name)
 
   return true
 end

@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { spawn } = require("child_process");
+const https = require("https");
 
 const DEFAULT_REPO_URL = "https://codeberg.org/uzu/strudel.git";
 
@@ -95,6 +96,7 @@ const CLI_ARGS = {
   REPO_DIR: "--repo-dir=",
   PORT: "--port=",
   REMOTE_DEBUG_PORT: "--remote-debug-port=",
+  DOC_ONLY: "--doc-only",
 };
 
 const userConfig = {
@@ -113,6 +115,7 @@ const userConfig = {
   repoDir: null,
   port: 0,
   remoteDebugPort: 0,
+  docOnly: false,
 };
 
 // Process program arguments at launch
@@ -155,6 +158,8 @@ for (const arg of process.argv) {
   } else if (arg.startsWith(CLI_ARGS.REMOTE_DEBUG_PORT)) {
     userConfig.remoteDebugPort =
       Number(arg.replace(CLI_ARGS.REMOTE_DEBUG_PORT, "")) || 0;
+  } else if (arg === CLI_ARGS.DOC_ONLY) {
+    userConfig.docOnly = true;
   }
 }
 if (!userConfig.userDataDir) {
@@ -198,6 +203,60 @@ function fileExists(p) {
   }
 }
 
+function canReachRemote(repoUrl, { timeoutMs = 2000 } = {}) {
+  return new Promise((resolve) => {
+    if (!repoUrl || typeof repoUrl !== "string") {
+      resolve(true);
+      return;
+    }
+
+    if (!repoUrl.startsWith("https://")) {
+      resolve(true);
+      return;
+    }
+
+    const url = new URL(repoUrl);
+    const req = https.request(
+      {
+        method: "HEAD",
+        protocol: url.protocol,
+        host: url.hostname,
+        port: url.port ? Number(url.port) : undefined,
+        path: url.pathname,
+        timeout: timeoutMs,
+        headers: {
+          "user-agent": "strudel.nvim/launch",
+          accept: "*/*",
+        },
+      },
+      (res) => {
+        res.resume();
+        const status = res.statusCode || 0;
+
+        // If the host is overloaded (503/504/522/etc), skip slow git operations.
+        if (status >= 500 && status <= 599) {
+          resolve(false);
+          return;
+        }
+
+        // 2xx/3xx are good. 4xx still indicates the host is reachable.
+        resolve(true);
+      },
+    );
+
+    req.on("timeout", () => {
+      req.destroy(new Error("timeout"));
+    });
+
+    req.on("error", () => {
+      // DNS/TLS/timeout/etc: treat it as unreachable.
+      resolve(false);
+    });
+
+    req.end();
+  });
+}
+
 function runCommand(command, args, opts = {}) {
   const { timeoutMs = 0, ...spawnOpts } = opts;
 
@@ -230,7 +289,12 @@ function runCommand(command, args, opts = {}) {
         } catch {
           // ignore
         }
-        reject(new Error(`${command} timed out after ${timeoutMs}ms`));
+        const detail = stderr || stdout;
+        reject(
+          new Error(
+            `${command} timed out after ${timeoutMs}ms${detail ? `\n${detail}` : ""}`,
+          ),
+        );
       }, timeoutMs);
     }
 
@@ -251,28 +315,43 @@ async function ensureRepo(repoDir, repoUrl) {
   if (!fileExists(gitDir)) {
     console.error("[strudel.nvim] cloning repo...", repoUrl);
     fs.mkdirSync(path.dirname(repoDir), { recursive: true });
+
+    // IMPORTANT: Clone the *Strudel* repo, not the legacy wrapper.
+    // The GitHub repo is a thin redirect containing only docs.
+    const cloneUrl = /github\.com\/tidalcycles\/strudel(?:\.git)?$/i.test(repoUrl)
+      ? "https://codeberg.org/uzu/strudel"
+      : repoUrl;
+
     const res = await runCommand(
       "git",
-      ["clone", "--depth", "1", repoUrl, repoDir],
+      ["clone", "--depth", "1", cloneUrl, repoDir],
       { timeoutMs: 5 * 60 * 1000 },
     );
     if (res.code !== 0) {
       throw new Error(
-        `git clone failed (repo: ${repoUrl}, dir: ${repoDir}): ${res.stderr || res.stdout}`,
+        `git clone failed (repo: ${cloneUrl}, dir: ${repoDir}): ${res.stderr || res.stdout}`,
       );
     }
     return;
   }
 
   // Best effort update: failure falls back to cached repo.
+  // If the upstream host is down (e.g. 5xx), skip git to avoid long timeouts.
+  const remoteOk = await canReachRemote(repoUrl, { timeoutMs: 2000 });
+  if (!remoteOk) {
+    console.error("[strudel.nvim] repo remote unreachable; using cached repo");
+    return;
+  }
+
   console.error("[strudel.nvim] updating cached repo...");
+
   const fetchRes = await runCommand(
     "git",
     ["-C", repoDir, "fetch", "--all", "--prune"],
     { timeoutMs: 2 * 60 * 1000 },
   );
   if (fetchRes.code !== 0) {
-    console.error("git fetch failed; using cached repo:", fetchRes.stderr || fetchRes.stdout);
+    console.error("git fetch failed; using cached repo:\n", fetchRes.stderr || fetchRes.stdout);
     return;
   }
 
@@ -282,28 +361,26 @@ async function ensureRepo(repoDir, repoUrl) {
     { timeoutMs: 2 * 60 * 1000 },
   );
   if (pullRes.code !== 0) {
-    console.error("git pull failed; using cached repo:", pullRes.stderr || pullRes.stdout);
+    console.error("git pull failed; using cached repo:\n", pullRes.stderr || pullRes.stdout);
   }
 }
 
 async function ensurePnpmInstall(repoDir) {
-  // We only need dependencies installed for running the website dev server.
-  // Keep installation scoped to the website package to minimize work.
-  const websiteDir = path.join(repoDir, "website");
-  const websiteNodeModules = path.join(websiteDir, "node_modules");
-  if (fileExists(websiteNodeModules)) {
+  const nodeModules = path.join(repoDir, "node_modules");
+  if (fileExists(nodeModules)) {
     return;
   }
 
-  console.error("[strudel.nvim] installing website deps (pnpm)...");
+  console.error("[strudel.nvim] installing repo deps (pnpm)...");
   const res = await runCommand("pnpm", ["install"], {
-    cwd: websiteDir,
+    cwd: repoDir,
     timeoutMs: 10 * 60 * 1000,
   });
   if (res.code !== 0) {
     throw new Error(`pnpm install failed: ${res.stderr || res.stdout}`);
   }
 }
+
 
 async function getRepoHead(repoDir) {
   const res = await runCommand("git", ["-C", repoDir, "rev-parse", "HEAD"], {
@@ -358,6 +435,56 @@ async function ensureDocJson(repoDir, outPath) {
     env,
     timeoutMs: 10 * 60 * 1000,
   });
+
+  // If jsdoc isn't exposed on PATH (some pnpm layouts), try a direct invoke.
+  if (res.code !== 0 && String(res.stderr || res.stdout).includes("jsdoc: command not found")) {
+    const pnpmDir = path.join(repoDir, "node_modules", ".pnpm");
+    let jsdocScript = null;
+
+    try {
+      const entries = fs.readdirSync(pnpmDir);
+      const jsdocEntry = entries.find((x) => x.startsWith("jsdoc@"));
+      if (jsdocEntry) {
+        jsdocScript = path.join(
+          pnpmDir,
+          jsdocEntry,
+          "node_modules",
+          "jsdoc",
+          "jsdoc.js",
+        );
+      }
+    } catch {
+      // ignore
+    }
+
+    if (!jsdocScript || !fileExists(jsdocScript)) {
+      throw new Error(`pnpm run jsdoc-json failed: ${res.stderr || res.stdout}`);
+    }
+
+    const res2 = await runCommand(
+      "node",
+      [
+        jsdocScript,
+        "packages/",
+        "--template",
+        "./node_modules/jsdoc-json",
+        "--destination",
+        "doc.json",
+        "-c",
+        "jsdoc/jsdoc.config.json",
+      ],
+      { cwd: repoDir, env, timeoutMs: 10 * 60 * 1000 },
+    );
+
+    if (res2.code === 0) {
+      await exportDocJsonFromRepo(outPath, repoDir);
+      writeJsonFileAtomic(metaPath, { head, generatedAt: new Date().toISOString() });
+      return;
+    }
+
+    const msg = res2.stderr || res2.stdout || res.stderr || res.stdout;
+    throw new Error(`jsdoc-json failed: ${msg}`);
+  }
   if (res.code !== 0) {
     throw new Error(`pnpm run jsdoc-json failed: ${res.stderr || res.stdout}`);
   }
@@ -699,7 +826,7 @@ async function handleEvent(message) {
 // Initialize browser and set up event handlers
 (async () => {
   try {
-    if (!userConfig.localServer) {
+    if (!userConfig.localServer && !userConfig.docOnly) {
       throw new Error(
         "Local server mode is required. Pass --local-server to launch.js.",
       );
@@ -713,6 +840,12 @@ async function handleEvent(message) {
 
     console.error("[strudel.nvim] ensureDocJson...");
     await ensureDocJson(userConfig.repoDir, userConfig.docJsonOut);
+
+    if (userConfig.docOnly) {
+      console.error("[strudel.nvim] doc-only mode: exiting");
+      return;
+    }
+
     const strudelUrl = await startLocalServer(userConfig.repoDir, userConfig.port);
 
 
